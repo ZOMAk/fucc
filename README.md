@@ -44,10 +44,6 @@ fucc recover
 
 已有进程不会自动更新环境；完整桌面会话环境更新需要注销后重新登录。`--user-only` 仅更新用户配置，系统时区和浏览器策略保持原状。
 
-Firefox Snap 通过机器策略适配，不改沙箱启动入口。其他 Snap / Flatpak 入口、VS Code 独立配置档（profiles）、Insiders、自定义 `user-data-dir`，以及 SSH、容器、WSL 等远程环境暂未覆盖。项目级或组织管理设置也可能覆盖用户设置。具体覆盖情况可用 `fucc status` 查看。
-
-0.0.2 升级后重跑 `fucc on --region us` 即可接入 Firefox，原有还原备份会保留。接入后请继续使用 0.0.3 管理。WebRTC 设置不能保证透明代理下所有流量经过代理；Firefox 自身的抗指纹保护也可能仍向网页报告 UTC 时区。
-
 ## 致谢
 
 - [check-cc](https://github.com/yacuo/check-cc)：提供环境检测思路参考。
