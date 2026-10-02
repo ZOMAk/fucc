@@ -286,7 +286,7 @@ def test_read_committed_target_rejects_bad_journal_binding_and_degraded_generati
         read_committed_target(root)
 
 
-@pytest.mark.parametrize("schema,version", [("fucc-local-transaction-v3", 3), (SCHEMA_V2, 3)])
+@pytest.mark.parametrize("schema,version", [("fucc-local-transaction-v4", 4), (SCHEMA_V2, 4)])
 def test_read_committed_target_rejects_future_state_without_previous_fallback(unified, schema, version):
     root, _, resources = unified
     LocalTransaction(root, resources, wire_version=2).apply(
@@ -332,7 +332,7 @@ def test_read_committed_target_rejects_initial_pending_and_allows_complete_inact
     assert read_committed_target(root) is None
 
 
-@pytest.mark.parametrize("schema,version", [("fucc-local-transaction-v3", 3), (SCHEMA_V2, 3)])
+@pytest.mark.parametrize("schema,version", [("fucc-local-transaction-v4", 4), (SCHEMA_V2, 4)])
 def test_unknown_wire_version_blocks_recovery_before_nested_mutation(fixture, schema, version):
     root, values, resources = fixture
     engine = LocalTransaction(root, resources)
@@ -353,7 +353,7 @@ def test_unknown_wire_version_blocks_recovery_before_nested_mutation(fixture, sc
     assert values == {"a": "America/New_York", "b": "east"}
 
 
-@pytest.mark.parametrize("version", [0, 3, True, "2"])
+@pytest.mark.parametrize("version", [0, 4, True, "2"])
 def test_constructor_and_apply_reject_invalid_wire_versions(fixture, version):
     root, _, resources = fixture
     with pytest.raises(FuccError):
@@ -367,7 +367,8 @@ def test_document_validator_supports_only_known_payload_versions():
     empty = {"committed": {"region": None, "revision": 0, "resources": []}, "journal": None}
     assert valid_document({**empty, "version": 1})
     assert valid_document({**empty, "version": 2})
-    assert not valid_document({**empty, "version": 3})
+    assert valid_document({**empty, "version": 3})
+    assert not valid_document({**empty, "version": 4})
 
 
 @pytest.mark.parametrize("pending", [False, True])

@@ -43,8 +43,8 @@ def managed(machine, tmp_path, monkeypatch):
     machine["options"]["sudo_uid"] = lambda: str(os.getuid())
     adapter = MachineAdapter(str(Path(cli.__file__).with_name("helper.py")), sys.executable, env, machine["options"])
 
-    def helper(python_path, entrypoint, action, owner_uid, environment, region=None, timezone=None):
-        state = run_machine_action(action, region, owner_uid, machine["options"], timezone=timezone)
+    def helper(python_path, entrypoint, action, owner_uid, environment, region=None, timezone=None, firefox=False):
+        state = run_machine_action(action, region, owner_uid, machine["options"], timezone=timezone, firefox=firefox is True)
         if state["kind"] in ("compensated", "recovery_required"):
             raise OSError("fixture helper did not commit")
 
@@ -76,6 +76,94 @@ def assert_all_targets(runtime, zone):
 def originals(runtime):
     ledger = json.loads((runtime.root / "local-transaction.json").read_text())["payload"]
     return {resource["id"]: deepcopy(resource["original"]) for resource in ledger["committed"]["resources"]}
+
+
+def install_firefox(machine, kind="snap"):
+    browser = next(browser for browser in machine["browsers"] if browser["id"] == "firefox")
+    browser.update(kind=kind, policySupported=True, snapInterfaceConnected=True if kind == "snap" else None)
+    path = Path(browser["directory"]) / "policies.json"
+    path.parent.mkdir(parents=True, mode=0o755)
+    path.parent.parent.chmod(0o755)
+    path.write_text('{"policies":{"DisableTelemetry":true,"Preferences":{"privacy.resistFingerprinting":true,"intl.accept_languages":"fr"}}}\n')
+    path.chmod(0o640)
+    return path
+
+
+def test_snap_firefox_upgrade_enrollment_and_full_restore(managed):
+    factory, _, machine = managed
+    runtime = factory()
+    runtime.on("us", timezone="America/Los_Angeles")
+    outer_baseline = originals(runtime)
+    private_path = machine["root"] / "machine/local-transaction.json"
+    old = json.loads(private_path.read_text())["payload"]
+    assert old["version"] == 2
+    old_originals = {entry["id"]: entry["original"] for entry in old["committed"]["resources"]}
+    path = install_firefox(machine)
+    baseline = path.read_bytes()
+    assert factory().on("us", timezone="America/Los_Angeles")["kind"] == "committed"
+    status = factory().status()
+    assert status["health"] == "healthy" and status["machine"]["firefoxManaged"] is True
+    firefox = next(browser for browser in status["machine"]["browsers"] if browser["id"] == "firefox")
+    assert firefox["installation"] == "snap" and firefox["configurationAligned"]
+    assert firefox["effectivePolicy"] == "verify_in_browser" and firefox["verificationPage"] == "about:policies"
+    assert originals(factory()) == outer_baseline
+    ledger = json.loads(private_path.read_text())["payload"]
+    assert ledger["version"] == 3
+    assert {entry["id"]: entry["original"] for entry in ledger["committed"]["resources"] if entry["id"] in old_originals} == old_originals
+    policies = json.loads(path.read_text())["policies"]
+    assert policies["DisableTelemetry"] is True and policies["Preferences"]["privacy.resistFingerprinting"] is True
+    assert policies["Preferences"]["intl.accept_languages"] == {"Value": "en-US,en", "Status": "locked"}
+    assert factory().on("us", timezone="America/Los_Angeles")["kind"] == "noop"
+    assert factory().off()["kind"] == "restored"
+    assert path.read_bytes() == baseline and path.stat().st_mode & 0o777 == 0o640
+    assert machine["zone"][0] == "Asia/Tokyo"
+    assert not (machine["root"] / "machine/firefox-profile.json").exists()
+
+
+def test_outer_failure_disables_new_firefox_profile_without_rebaselining(managed):
+    factory, _, machine = managed
+    runtime = factory()
+    runtime.on("us", timezone="America/Los_Angeles")
+    path = install_firefox(machine)
+    baseline = path.read_bytes()
+    original_write = runtime.machine.resource.write
+    failed = [False]
+
+    def fail_after_nested_commit(value):
+        original_write(value)
+        if value.get("firefox") is True and not failed[0]:
+            failed[0] = True
+            raise OSError("fixture outer failure after Firefox commit")
+
+    runtime.machine.resource.write = fail_after_nested_commit
+    assert runtime.on("us", timezone="America/Los_Angeles")["kind"] == "compensated"
+    assert_all_targets(factory(), "America/Los_Angeles")
+    assert path.read_bytes() == baseline and path.stat().st_mode & 0o777 == 0o640
+    public = json.loads((machine["root"] / "status.json").read_text())
+    assert public["schema"] == "fucc-machine-public-v3" and public["firefoxManaged"] is False
+    assert "firefox" not in runtime.machine.resource.read()
+    saved = json.loads((machine["root"] / "machine/local-transaction.json").read_text())["payload"]
+    firefox_original = next(entry["original"] for entry in saved["committed"]["resources"] if entry["id"] == "policy.firefox")
+    assert firefox_original == {"text": baseline.decode(), "mode": 0o640}
+    assert factory().on("us", timezone="America/Los_Angeles")["kind"] == "committed"
+    assert factory().off()["kind"] == "restored" and path.read_bytes() == baseline
+
+
+def test_firefox_user_only_and_external_policy_drift_are_preserved(managed):
+    factory, _, machine = managed
+    path = install_firefox(machine)
+    baseline = path.read_bytes()
+    assert factory().on("us", user_only=True)["kind"] == "committed"
+    assert path.read_bytes() == baseline and machine["zone"][0] == "Asia/Tokyo"
+    assert factory().on("us")["kind"] == "committed"
+    data = json.loads(path.read_text())
+    data["policies"]["Preferences"]["intl.accept_languages"]["Value"] = "fr"
+    path.write_text(json.dumps(data))
+    changed = path.read_bytes()
+    assert factory().status()["health"] == "degraded"
+    assert factory().off()["kind"] == "recovery_required"
+    assert factory().recover()["kind"] == "recovery_required"
+    assert path.read_bytes() == changed
 
 
 def test_ip_selected_target_reaches_all_adapters_and_restores_initial_baseline(managed, capsys, monkeypatch):

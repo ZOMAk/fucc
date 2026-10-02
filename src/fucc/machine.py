@@ -14,9 +14,12 @@ import subprocess
 
 from .errors import FuccError
 from .files import read_snapshot, replace_snapshot
+from .firefox import (desired_snapshot as firefox_snapshot, discover_firefox,
+                      policy_aligned as firefox_aligned)
 from .regions import TARGET_REGIONS, get_target_region
-from .state import MutationLock, canonical_json, is_safe_json
-from .transaction import LocalTransaction, Resource, matches_resource_claim
+from .state import MutationLock, canonical_json, is_safe_json, read_checked
+from .transaction import (MARKER_SCHEMA, LocalTransaction, Resource, matches_resource_claim,
+                          read_resource_bindings)
 
 MACHINE_ROOT = "/var/lib/fucc"
 BROWSERS = [
@@ -24,12 +27,15 @@ BROWSERS = [
     {"id": "chromium", "label": "Chromium", "kind": "not_installed", "directory": "/etc/chromium/policies/managed"},
     {"id": "chromium-browser", "label": "Chromium (distro)", "kind": "not_installed", "directory": "/etc/chromium-browser/policies/managed"},
     {"id": "edge", "label": "Edge", "kind": "not_installed", "directory": "/etc/opt/edge/policies/managed"},
+    {"id": "firefox", "label": "Firefox", "kind": "not_installed", "directory": "/etc/firefox/policies",
+     "policySupported": False, "snapInterfaceConnected": None},
 ]
 CANDIDATES = {
     "chrome": ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/opt/google/chrome/chrome"],
     "chromium": ["/usr/bin/chromium", "/usr/lib/chromium/chromium"],
     "chromium-browser": ["/usr/bin/chromium-browser", "/usr/lib/chromium-browser/chromium-browser"],
     "edge": ["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable", "/opt/microsoft/msedge/msedge"],
+    "firefox": ["/usr/bin/firefox", "/usr/bin/firefox-esr", "/usr/lib/firefox/firefox", "/opt/firefox/firefox"],
 }
 FLATPAK_IDS = {"chrome": "com.google.Chrome", "chromium": "org.chromium.Chromium", "edge": "com.microsoft.Edge"}
 LANGUAGES = {"us": ["en-US", "en"], "eu": ["en-GB", "en"], "jp": ["ja-JP", "ja"], "sg": ["en-SG", "en"]}
@@ -51,13 +57,14 @@ def _region(value):
 
 def _valid_switch(value):
     if (type(value) is not dict or not {"active", "region", "ownerUid"}.issubset(value)
-            or not set(value).issubset({"active", "region", "ownerUid", "timezone"})
+            or not set(value).issubset({"active", "region", "ownerUid", "timezone", "firefox"})
             or type(value["active"]) is not bool):
         return False
     if not value["active"]:
-        return value["region"] is None and value["ownerUid"] is None and "timezone" not in value
+        return value["region"] is None and value["ownerUid"] is None and "timezone" not in value and "firefox" not in value
     return (_region(value["region"]) and _uid(value["ownerUid"])
-            and ("timezone" not in value or _dynamic_zone(value["region"], value["timezone"])))
+            and ("timezone" not in value or _dynamic_zone(value["region"], value["timezone"]))
+            and ("firefox" not in value or value["firefox"] is True))
 
 
 def _dynamic_zone(region, zone):
@@ -74,10 +81,13 @@ def _blank():
 
 
 def _valid_public(value):
-    if type(value) is not dict or set(value) not in (set(_blank()), set(_blank()) | {"timezone"}):
+    if type(value) is not dict or set(value) not in (set(_blank()), set(_blank()) | {"timezone"},
+                                                   set(_blank()) | {"firefoxManaged"}, set(_blank()) | {"timezone", "firefoxManaged"}):
         return False
     dynamic = "timezone" in value
-    return (value["schema"] == ("fucc-machine-public-v2" if dynamic else "fucc-machine-public-v1")
+    firefox = "firefoxManaged" in value
+    return (value["schema"] == ("fucc-machine-public-v3" if firefox else "fucc-machine-public-v2" if dynamic else "fucc-machine-public-v1")
+            and (not firefox or type(value["firefoxManaged"]) is bool and value["active"] is True)
             and (not dynamic or value["active"] is True and _region(value["region"]) and _dynamic_zone(value["region"], value["timezone"]))
             and type(value["active"]) is bool
             and ((_region(value["region"]) and _uid(value["ownerUid"])) if value["active"] else
@@ -86,6 +96,7 @@ def _valid_public(value):
             and value["transaction"] in ("none", "apply", "restore")
             and type(value["managedBrowsers"]) is list
             and all(type(x) is str and x in CANDIDATES for x in value["managedBrowsers"])
+            and (("firefox" in value["managedBrowsers"]) == (firefox and value["firefoxManaged"]))
             and len(set(value["managedBrowsers"])) == len(value["managedBrowsers"]))
 
 
@@ -135,7 +146,7 @@ def _command(command, args):
 def discover_machine_browsers():
     """Inspect installation files without executing browser binaries or scripts."""
     result = []
-    for browser in BROWSERS:
+    for browser in BROWSERS[:-1]:
         kind = "not_installed"
         for candidate in CANDIDATES[browser["id"]]:
             try:
@@ -161,7 +172,16 @@ def discover_machine_browsers():
             elif browser["id"] in FLATPAK_IDS and Path("/var/lib/flatpak/app", FLATPAK_IDS[browser["id"]]).exists():
                 kind = "flatpak"
         result.append({**browser, "kind": kind})
+    result.append(discover_firefox())
     return result
+
+
+def _policy_path(browser):
+    return Path(browser["directory"]) / ("policies.json" if browser["id"] == "firefox" else "fucc.json")
+
+
+def _firefox_supported(browser):
+    return browser["kind"] in ("native", "snap") and browser.get("policySupported") is True
 
 
 class _Context:
@@ -173,6 +193,7 @@ class _Context:
         self.private_root = self.root / "machine"
         self.public_path = self.root / "status.json"
         self.owner_path = self.private_root / "owner.json"
+        self.firefox_profile_path = self.private_root / "firefox-profile.json"
         self.trusted_uid = options.get("trusted_uid", options.get("trustedUid", 0))
         self.effective_uid = options.get("effective_uid", options.get("effectiveUid", os.geteuid))
         self.sudo_uid = options.get("sudo_uid", options.get("sudoUid", lambda: os.environ.get("SUDO_UID")))
@@ -235,18 +256,21 @@ class _Context:
         self.trusted_path(self.public_path)
         replace_snapshot(self.public_path, {"text": json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n", "mode": 0o644}, read_snapshot(self.public_path))
 
-    def read_owner(self):
+    def read_owner_snapshot(self):
         self.trusted_path(self.owner_path)
         snapshot = read_snapshot(self.owner_path)
         if snapshot["text"] is None:
-            return None
+            return None, snapshot
         try:
             value = json.loads(snapshot["text"])
         except ValueError as exc:
             raise _fail("MACHINE_STATE_INVALID", "机器配置所有者记录损坏") from exc
         if type(value) is not dict or set(value) != {"ownerUid"} or not _uid(value["ownerUid"]):
             raise _fail("MACHINE_STATE_INVALID", "机器配置所有者记录无效")
-        return value["ownerUid"]
+        return value["ownerUid"], snapshot
+
+    def read_owner(self):
+        return self.read_owner_snapshot()[0]
 
     def read_timezone(self):
         zone = self.run("/usr/bin/timedatectl", ["show", "--property=Timezone", "--value"]).strip()
@@ -267,6 +291,8 @@ class _Context:
                 pass
 
     def conflicts(self, browser):
+        if browser["id"] == "firefox":
+            return  # Firefox consumes its single policies.json file.
         directory = Path(browser["directory"])
         try:
             paths = list(directory.iterdir())
@@ -300,83 +326,159 @@ def _summary(ctx, state, installations):
         aligned = None
         if managed:
             try:
-                path = Path(browser["directory"]) / "fucc.json"
+                path = _policy_path(browser)
                 ctx.trusted_path(path)
                 ctx.readable_directory(browser)
                 snapshot = read_snapshot(path)
-                actual = {} if snapshot["text"] is None else _policy_object(snapshot["text"], browser["label"])
-                expected = desired_policies(browser, state["region"])
-                ctx.conflicts(browser)
-                aligned = snapshot["mode"] == 0o644 and all(canonical_json(actual.get(key)) == canonical_json(value) for key, value in expected.items())
+                if browser["id"] == "firefox":
+                    aligned = snapshot["mode"] == 0o644 and firefox_aligned(snapshot["text"], state["region"])
+                else:
+                    actual = {} if snapshot["text"] is None else _policy_object(snapshot["text"], browser["label"])
+                    expected = desired_policies(browser, state["region"])
+                    ctx.conflicts(browser)
+                    aligned = snapshot["mode"] == 0o644 and all(canonical_json(actual.get(key)) == canonical_json(value) for key, value in expected.items())
             except Exception:
                 aligned = False
-        unsupported = browser["kind"] in ("snap", "flatpak")
-        message = ("Snap/Flatpak 策略路径隔离；此版本不支持，请使用原生安装。" if unsupported else
+        unsupported = (browser["kind"] != "not_installed" and not _firefox_supported(browser)
+                       if browser["id"] == "firefox" else browser["kind"] in ("snap", "flatpak"))
+        message = ((browser.get("message") or "Firefox 需在 about:policies 核对策略生效。") if browser["id"] == "firefox" else
+                   "Snap/Flatpak 策略路径隔离；此版本不支持，请使用原生安装。" if unsupported else
                    "原生 Edge 语言策略已适配；Linux WebRTC 策略未获得官方支持确认。需在 edge://policy 验证策略。" if browser["id"] == "edge" else
                    "配置文件已核对；完全退出浏览器后启动，并在 chrome://policy 验证生效。" if managed else "未配置浏览器策略。")
         browsers.append({"id": browser["id"], "label": browser["label"], "installation": browser["kind"],
-                         "policyPath": str(Path(browser["directory"]) / "fucc.json"), "managed": managed,
+                         "policyPath": str(_policy_path(browser)), "managed": managed,
                          "configurationAligned": aligned, "effectivePolicy": "unsupported" if unsupported else "verify_in_browser" if managed else "not_configured",
                          "webRtcPolicy": "unsupported" if unsupported or browser["id"] == "edge" else "configured" if managed else "not_configured",
-                         "restartRequired": managed, "message": message})
+                         "restartRequired": managed, "message": message,
+                         **({"verificationPage": "about:policies", "policySupported": _firefox_supported(browser),
+                             "snapInterfaceConnected": browser.get("snapInterfaceConnected"),
+                             "distributionPolicyPaths": browser.get("distributionPolicyPaths", []),
+                             "distributionPolicyConflict": browser.get("distributionPolicyConflict", False)} if browser["id"] == "firefox" else {})})
     health = "recovery_required" if state["recoveryRequired"] else "degraded" if timezone_aligned is False or any(x["configurationAligned"] is False for x in browsers) else "healthy"
     return {"scope": "machine", "active": state["active"], "region": state["region"], "ownerUid": state["ownerUid"],
             "recoveryRequired": state["recoveryRequired"], "health": health, "transaction": state["transaction"],
             "revision": state["revision"], "actualTimezone": actual_timezone, "configuredTimezone": configured_timezone,
             "timezoneAligned": timezone_aligned, "requiresAdministrator": ctx.effective_uid() != 0, "browsers": browsers,
-            **({"timezone": state["timezone"]} if "timezone" in state else {})}
+            **({"timezone": state["timezone"]} if "timezone" in state else {}),
+            **({"firefoxManaged": state["firefoxManaged"]} if "firefoxManaged" in state else {})}
 
 
-def _resources(ctx, installations):
+def _resources(ctx, installations, include_firefox=False):
+    owner_snapshot = [None]
+
+    def read_owner():
+        owner, snapshot = ctx.read_owner_snapshot()
+        owner_snapshot[0] = snapshot
+        return owner
+
     def write_owner(value):
         if value is not None and not _uid(value):
             raise _fail("MACHINE_STATE_INVALID", "无效机器所有者")
         ctx.trusted_path(ctx.owner_path)
+        if owner_snapshot[0] is None:
+            raise _fail("MACHINE_STATE_INVALID", "所有者写入缺少已验证快照")
         desired = {"text": None if value is None else json.dumps({"ownerUid": value}, separators=(",", ":")) + "\n", "mode": None if value is None else 0o600}
-        replace_snapshot(ctx.owner_path, desired, read_snapshot(ctx.owner_path))
+        replace_snapshot(ctx.owner_path, desired, owner_snapshot[0])
 
     def write_timezone(value):
         if type(value) is not str or len(value) > 128 or not ZONE.fullmatch(value):
             raise _fail("MACHINE_STATE_INVALID", "无效恢复时区")
         ctx.run("/usr/bin/timedatectl", ["set-timezone", value])
 
-    resources = [Resource("owner", str(ctx.owner_path), ctx.read_owner, write_owner),
+    resources = [Resource("owner", str(ctx.owner_path), read_owner, write_owner),
                  Resource("timezone", "/usr/bin/timedatectl:system-timezone", ctx.read_timezone, write_timezone)]
     for browser in installations:
-        path = Path(browser["directory"]) / "fucc.json"
+        if browser["id"] == "firefox" and not include_firefox:
+            continue
+        path = _policy_path(browser)
+        observed = [None]
 
-        def read(path=path):
+        def read(path=path, observed=observed):
             ctx.trusted_path(path)
-            return read_snapshot(path)
+            snapshot = read_snapshot(path)
+            observed[0] = snapshot
+            return snapshot
 
-        def write(value, path=path, browser=browser):
+        def write(value, path=path, browser=browser, observed=observed):
             desired = _parse_snapshot(value)
             ctx.trusted_path(path)
             if desired["text"] is not None:
                 ctx.conflicts(browser)
                 ctx.readable_directory(browser)
                 ctx.create_directory(browser["directory"], 0o755)
-            replace_snapshot(path, desired, read_snapshot(path))
+            if observed[0] is None:
+                raise _fail("MACHINE_STATE_INVALID", "策略写入缺少已验证快照")
+            replace_snapshot(path, desired, observed[0])
 
         resources.append(Resource("policy." + browser["id"], str(path), read, write))
+    if include_firefox:
+        profile_snapshot = [None]
+
+        def read_profile():
+            ctx.trusted_path(ctx.firefox_profile_path)
+            snapshot = read_snapshot(ctx.firefox_profile_path)
+            profile_snapshot[0] = snapshot
+            text = snapshot["text"]
+            if text is None:
+                return None
+            try:
+                value = json.loads(text)
+            except ValueError as exc:
+                raise _fail("MACHINE_STATE_INVALID", "Firefox 配置档标记损坏；请保留恢复记录") from exc
+            if type(value) is not dict or set(value) != {"enabled"} or type(value["enabled"]) is not bool:
+                raise _fail("MACHINE_STATE_INVALID", "Firefox 配置档标记无效；请保留恢复记录")
+            return value["enabled"]
+
+        def write_profile(value):
+            if value is not None and type(value) is not bool:
+                raise _fail("MACHINE_STATE_INVALID", "无效 Firefox 配置档目标")
+            ctx.trusted_path(ctx.firefox_profile_path)
+            if profile_snapshot[0] is None:
+                raise _fail("MACHINE_STATE_INVALID", "Firefox 标记写入缺少已验证快照")
+            desired = {"text": None if value is None else json.dumps({"enabled": value}, separators=(",", ":")) + "\n",
+                       "mode": None if value is None else 0o600}
+            replace_snapshot(ctx.firefox_profile_path, desired, profile_snapshot[0])
+
+        resources.append(Resource("firefox-profile", str(ctx.firefox_profile_path), read_profile, write_profile))
     return resources
 
 
-def _public_from_status(status, owner, browsers, force_recovery, request_owner, committed_timezone=None):
+def _saved_resources(ctx, installations):
+    """Restore exactly the registered authorities, irrespective of discovery."""
+    candidates = _resources(ctx, installations, include_firefox=True)
+    bindings = read_resource_bindings(ctx.private_root)
+    if not bindings:
+        return [resource for resource in candidates if resource.id not in ("policy.firefox", "firefox-profile")]
+    known = {resource.id: resource for resource in candidates}
+    ids = {binding["id"] for binding in bindings}
+    core = set(known) - {"policy.firefox", "firefox-profile"}
+    if ids not in (core, set(known)) or any(binding["identity"] != known[binding["id"]].identity for binding in bindings):
+        raise _fail("MACHINE_STATE_INVALID", "机器资源绑定不匹配；请保留恢复记录")
+    return [known[binding["id"]] for binding in bindings]
+
+
+def _public_from_status(status, owner, browsers, force_recovery, request_owner, committed_timezone=None,
+                        firefox_enrolled=False, committed_firefox=None):
     active = status["active"] and status["region"] is not None and owner is not None
     recovery = force_recovery or status["health"] == "recovery_required" or (status["active"] and not active)
     result = {"schema": "fucc-machine-public-v1", "active": active, "region": status["region"] if active else None,
             "ownerUid": owner if owner is not None else request_owner if recovery else None,
             "recoveryRequired": recovery, "revision": status["revision"], "transaction": status["transaction"],
-            "managedBrowsers": [x["id"] for x in browsers if x["kind"] == "native"] if active else []}
+            "managedBrowsers": [x["id"] for x in browsers if x["id"] != "firefox" and x["kind"] == "native"] if active else []}
     if active:
         canonical = get_target_region(status["region"], committed_timezone)["timezone"]
         if canonical != TARGET_REGIONS[status["region"]]["timezone"]:
             result.update(schema="fucc-machine-public-v2", timezone=canonical)
+        if firefox_enrolled:
+            if type(committed_firefox) is not bool:
+                raise _fail("MACHINE_STATE_INVALID", "已登记 Firefox 配置档缺少可信目标")
+            result.update(schema="fucc-machine-public-v3", firefoxManaged=committed_firefox)
+            if committed_firefox:
+                result["managedBrowsers"].append("firefox")
     return result
 
 
-def run_machine_action(action, region=None, owner_uid=None, options=None, timezone=None):
+def run_machine_action(action, region=None, owner_uid=None, options=None, timezone=None, firefox=False):
     if not _uid(owner_uid):
         raise _fail("INVALID_OWNER", "owner UID 必须是非负整数")
     if action not in ("on", "off", "recover", "status"):
@@ -385,6 +487,8 @@ def run_machine_action(action, region=None, owner_uid=None, options=None, timezo
         raise _fail("INVALID_REGION", "开启机器配置必须指定有效地区")
     if timezone is not None and action != "on":
         raise _fail("INVALID_ACTION", "时区参数仅用于开启配置；恢复使用保存的目标")
+    if type(firefox) is not bool or firefox and action != "on":
+        raise _fail("INVALID_ACTION", "Firefox 配置档参数仅用于开启配置")
     target_timezone = get_target_region(region, timezone)["timezone"] if action == "on" else None
     ctx = _Context(options)
     installations = ctx.discover()
@@ -413,7 +517,18 @@ def run_machine_action(action, region=None, owner_uid=None, options=None, timezo
             raise _fail("OWNER_MISMATCH", "机器配置属于另一个用户，当前用户不能修改或还原")
         if previous["recoveryRequired"] and action != "recover":
             raise _fail("MACHINE_RECOVERY_REQUIRED", "机器配置事务未完成；请先运行 fucc recover")
-        transaction = LocalTransaction(ctx.private_root, _resources(ctx, installations),
+        marker = read_checked(ctx.private_root, ctx.private_root / "local-transaction.initialized", MARKER_SCHEMA)
+        ctx.trusted_path(ctx.firefox_profile_path)
+        profile_evidence = read_snapshot(ctx.firefox_profile_path)["text"] is not None
+        if marker["kind"] == "missing" and (previous["active"] or previous["revision"] > 0 or owner is not None
+                                            or previous["recoveryRequired"] or previous["ownerUid"] is not None
+                                            or previous["transaction"] != "none" or profile_evidence):
+            # Public/owner records are durable evidence of an earlier lifecycle.
+            # Missing all private authorities must never recapture protected
+            # configuration as its own original baseline.
+            raise _fail("MACHINE_STATE_INVALID", "机器原始状态记录丢失；保留现有策略和公开状态，拒绝重新登记")
+        registered = _saved_resources(ctx, installations)
+        transaction = LocalTransaction(ctx.private_root, registered,
                                        wire_version=2 if action == "on" and target_timezone != TARGET_REGIONS[region]["timezone"] else 1)
         before = transaction.status()
         if action == "recover" and previous["ownerUid"] is None and owner is None and (before["active"] or before["transaction"] != "none" or before["health"] == "recovery_required"):
@@ -423,10 +538,32 @@ def run_machine_action(action, region=None, owner_uid=None, options=None, timezo
         if action != "recover" and before["health"] == "recovery_required":
             raise _fail("MACHINE_RECOVERY_REQUIRED", "机器配置状态需要恢复")
         desired = None
+        enroll = False
         if action == "on":
+            installed_firefox = next(browser for browser in installations if browser["id"] == "firefox")
+            firefox_enrolled = any(resource.id == "firefox-profile" for resource in registered)
+            if firefox and not firefox_enrolled:
+                if not _firefox_supported(installed_firefox):
+                    raise _fail("UNSUPPORTED_FEATURE", "Firefox 安装不支持宿主策略；请检查 Snap 接口或安装方式")
+                registered = _resources(ctx, installations, include_firefox=True)
+                enroll = True
             desired = {"owner": owner_uid, "timezone": target_timezone}
             for browser in installations:
-                path = Path(browser["directory"]) / "fucc.json"
+                if browser["id"] == "firefox":
+                    if not firefox_enrolled and not enroll:
+                        continue
+                    path = _policy_path(browser)
+                    ctx.trusted_path(path)
+                    if firefox:
+                        current = read_snapshot(path)
+                        ctx.readable_directory(browser)
+                        desired["policy.firefox"] = firefox_snapshot(current, region)
+                        desired["firefox-profile"] = True
+                    else:
+                        desired["policy.firefox"] = transaction.committed_original("policy.firefox")
+                        desired["firefox-profile"] = False
+                    continue
+                path = _policy_path(browser)
                 ctx.trusted_path(path)
                 current = read_snapshot(path)
                 if browser["kind"] == "native":
@@ -436,22 +573,34 @@ def run_machine_action(action, region=None, owner_uid=None, options=None, timezo
                     desired["policy." + browser["id"]] = {"text": json.dumps({**policies, **desired_policies(browser, region)}, ensure_ascii=False, indent=2) + "\n", "mode": 0o644}
                 else:
                     desired["policy." + browser["id"]] = current
+            if enroll:
+                transaction = LocalTransaction(ctx.private_root, registered, wire_version=3)
         ctx.publish({**previous, "ownerUid": previous["ownerUid"] if previous["ownerUid"] is not None else owner_uid,
                      "recoveryRequired": True, "transaction": "apply" if action == "on" else "restore" if action == "off" else previous["transaction"]})
-        result = transaction.apply(region, desired) if action == "on" else transaction.restore() if action == "off" else transaction.recover()
+        result = transaction.apply(region, desired, enroll=enroll) if action == "on" else transaction.restore() if action == "off" else transaction.recover()
+        # Enrollment compensation can deliberately return to the old, smaller
+        # binding set. Its status must use those exact restored authorities.
+        registered = _saved_resources(ctx, installations)
+        transaction = LocalTransaction(ctx.private_root, registered)
         after = transaction.status()
+        committed_firefox = transaction.committed_desired("firefox-profile")
         state = _public_from_status(after, ctx.read_owner(), installations, result["kind"] == "recovery_required", owner_uid,
-                                    transaction.committed_desired("timezone"))
+                                    transaction.committed_desired("timezone"),
+                                    type(committed_firefox) is bool, committed_firefox)
         ctx.publish(state)
         return {**_summary(ctx, state, installations), "kind": result["kind"]}
 
 
-def _invoke_helper(python_path, entrypoint, action, owner_uid, environment, region=None, timezone=None):
+def _invoke_helper(python_path, entrypoint, action, owner_uid, environment, region=None, timezone=None, firefox=None):
     command = ["/usr/bin/sudo", "--", python_path, "-I", entrypoint, "__machine", action, "--owner", str(owner_uid)]
     if region is not None:
         command.extend(["--region", region])
     if timezone is not None:
         command.extend(["--timezone", get_target_region(region, timezone)["timezone"]])
+    if firefox is not None:
+        if type(firefox) is not bool or action != "on":
+            raise _fail("INVALID_ACTION", "Firefox 配置档参数无效")
+        command.extend(["--firefox", "on" if firefox else "off"])
     env = {"PATH": SYSTEM_ENV["PATH"]}
     if "TERM" in environment:
         env["TERM"] = environment["TERM"]
@@ -468,11 +617,16 @@ def _invoke_helper(python_path, entrypoint, action, owner_uid, environment, regi
             reported_timezone = parsed.get("configuredTimezone", parsed.get("timezone", TARGET_REGIONS[parsed["region"]]["timezone"]))
             if "timezone" in parsed or reported_timezone != TARGET_REGIONS[parsed["region"]]["timezone"]:
                 switch["timezone"] = parsed.get("timezone", reported_timezone)
+            if parsed.get("firefoxManaged") is True:
+                switch["firefox"] = True
         if (type(parsed) is not dict or parsed.get("scope") != "machine" or parsed.get("recoveryRequired") is not False
                 or not _valid_switch(switch)
                 or ("timezone" in parsed and reported_timezone != parsed["timezone"])
+                or ("firefoxManaged" in parsed and type(parsed["firefoxManaged"]) is not bool)
+                or (parsed.get("firefoxManaged") is True and parsed.get("active") is not True)
                 or (action == "on" and (parsed["active"] is not True or parsed["region"] != region or parsed["ownerUid"] != owner_uid
-                                         or reported_timezone != get_target_region(region, timezone)["timezone"]))
+                                         or reported_timezone != get_target_region(region, timezone)["timezone"]
+                                         or parsed.get("firefoxManaged", False) is not (firefox is True)))
                 or (action == "off" and parsed["active"] is not False)):
             raise ValueError("invalid helper result")
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -498,8 +652,12 @@ class MachineAdapter:
         if not _region(region):
             raise _fail("INVALID_REGION", "无效机器配置地区")
         canonical = get_target_region(region, timezone)["timezone"]
+        state = self.inspect()
+        firefox = state.get("firefoxManaged") is True or any(browser["id"] == "firefox" and browser.get("policySupported") is True
+                     for browser in state["browsers"])
         return {"active": True, "region": region, "ownerUid": self.owner_uid,
-                **({"timezone": canonical} if canonical != TARGET_REGIONS[region]["timezone"] else {})}
+                **({"timezone": canonical} if canonical != TARGET_REGIONS[region]["timezone"] else {}),
+                **({"firefox": True} if firefox else {})}
 
     def recover(self):
         _invoke_helper(self.python_path, self.entrypoint, "recover", self.owner_uid, self.environment)
@@ -509,7 +667,8 @@ class MachineAdapter:
         if state["recoveryRequired"] or state["health"] != "healthy":
             raise _fail("MACHINE_RECOVERY_REQUIRED", "机器配置未对齐或事务需要恢复；请检查 fucc status")
         return {"active": state["active"], "region": state["region"], "ownerUid": state["ownerUid"] if state["active"] else None,
-                **({"timezone": state["timezone"]} if "timezone" in state else {})}
+                **({"timezone": state["timezone"]} if "timezone" in state else {}),
+                **({"firefox": True} if state.get("firefoxManaged") is True else {})}
 
     def _write(self, value):
         if not _valid_switch(value) or value["active"] and value["ownerUid"] != self.owner_uid:
@@ -519,5 +678,7 @@ class MachineAdapter:
             raise _fail("OWNER_MISMATCH", "机器配置属于另一个用户")
         if current["recoveryRequired"]:
             self.recover()
+        firefox = value.get("firefox", False)
+        profile_argument = firefox if value["active"] and (firefox or current.get("firefoxManaged") is True) else None
         _invoke_helper(self.python_path, self.entrypoint, "on" if value["active"] else "off", self.owner_uid, self.environment,
-                       value["region"], value.get("timezone"))
+                       value["region"], value.get("timezone"), profile_argument)

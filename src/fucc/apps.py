@@ -223,6 +223,8 @@ def _application_kind(identity: str, text: str) -> dict | None:
         return {"kind": "chrome", "name": "Chromium" if re.search("chromium", identity, re.I) else "Google Chrome"}
     if re.search(r"microsoft[.-]?edge|\bmsedge\b", identity, re.I):
         return {"kind": "edge", "name": "Microsoft Edge"}
+    if re.search(r"\bfirefox\b|org\.mozilla\.firefox", identity, re.I):
+        return {"kind": "firefox", "name": "Firefox"}
     if re.search(r"com\.microsoft\.VSCode|visual studio code|(?:^|[\s/])code(?:-url-handler|\.desktop|\s|$)", identity, re.I):
         return {"kind": "vscode", "name": "Visual Studio Code"}
     if re.search(r"\bclaude\b", identity, re.I):
@@ -268,7 +270,7 @@ class UserAdapters:
         }
 
 
-def create_user_adapters(environment: Mapping[str, str] | None = None, application_dirs: list[str] | None = None, managed_desktop_files: list[dict] | None = None) -> UserAdapters:
+def create_user_adapters(environment: Mapping[str, str] | None = None, application_dirs: list[str] | None = None, managed_desktop_files: list[dict] | None = None, *, enroll_firefox: bool = False) -> UserAdapters:
     environment = os.environ if environment is None else environment
     home = _home(environment)
     config_home = _config_home(environment)
@@ -325,7 +327,8 @@ def create_user_adapters(environment: Mapping[str, str] | None = None, applicati
             application = {"id": identity, **kind, "desktopFile": source, "supported": False}
             sandboxed = re.search(r"(?:^|[\s/])(?:flatpak|snap)(?:\s|/)|^X-(?:Flatpak|SnapInstanceName)=|/snap/", snapshot["text"], re.M) or re.search(r"(?:flatpak|snapd)/", str(directory))
             if sandboxed:
-                applications.append({**application, "reason": "Snap / Flatpak 沙箱入口尚不支持环境继承"})
+                snap_firefox = kind["kind"] == "firefox" and not re.search(r"\bflatpak\b|^X-Flatpak=", snapshot["text"], re.M) and "flatpak/" not in str(directory)
+                applications.append({**application, "reason": "Snap Firefox 使用机器策略；沙箱入口不注入环境变量" if snap_firefox else "Snap / Flatpak 沙箱入口尚不支持环境继承"})
                 continue
             if re.search(r"^Hidden=true\s*$", snapshot["text"], re.M):
                 applications.append({**application, "reason": "桌面入口已隐藏"})
@@ -335,11 +338,13 @@ def create_user_adapters(environment: Mapping[str, str] | None = None, applicati
                 contents = wrap_desktop_entry(snapshot["text"], paths["launcher"])
                 read_snapshot(destination)
                 resource_id = desktop_resource_id(identity)
-                if bound is None:
+                enrolled = bound is None or any(entry["id"] == resource_id for entry in bound)
+                if bound is None or (enroll_firefox and kind["kind"] == "firefox" and not enrolled):
                     resources.append(snapshot_resource(resource_id, destination))
                     desired_files[resource_id] = {"text": contents, "mode": 0o644}
-                managed = bound is None or any(entry["id"] == resource_id for entry in bound)
-                applications.append({**application, "supported": managed, **({} if managed else {"reason": "开启期间发现新入口；请先关闭再开启 FUCC 以接入"})})
+                    enrolled = True
+                reason = "运行 fucc on 接入 Firefox" if kind["kind"] == "firefox" else "开启期间发现新入口；请先关闭再开启 FUCC 以接入"
+                applications.append({**application, "supported": enrolled, **({} if enrolled else {"reason": reason})})
             except (OSError, FuccError):
                 applications.append({**application, "reason": "桌面入口格式或用户覆盖路径不支持安全适配"})
     for entry in bound or []:
@@ -348,7 +353,7 @@ def create_user_adapters(environment: Mapping[str, str] | None = None, applicati
             snapshot = read_snapshot(entry["identity"])
             kind = _application_kind(identity, snapshot["text"] or "") or {"kind": "application", "name": identity}
             applications.append({"id": identity, **kind, "desktopFile": entry["identity"], "supported": snapshot["text"] is not None, "reason": "已保存受管入口缺失；需要恢复配置冲突" if snapshot["text"] is None else "使用已保存的用户桌面入口"})
-    for kind, name in (("chrome", "Chrome / Chromium"), ("vscode", "Visual Studio Code"), ("claude", "Claude Desktop")):
+    for kind, name in (("chrome", "Chrome / Chromium"), ("firefox", "Firefox"), ("vscode", "Visual Studio Code"), ("claude", "Claude Desktop")):
         if not any(application["kind"] == kind for application in applications):
             applications.append({"id": kind, "kind": kind, "name": name, "desktopFile": None, "supported": False, "reason": "未发现本机桌面入口"})
     env_path = os.path.join(config_home, "fucc", "env.sh")

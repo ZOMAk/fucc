@@ -1,4 +1,4 @@
-FUCC (Fix You, Claude Code) 0.0.2
+FUCC (Fix You, Claude Code) 0.0.3
 
 This Python implementation derives Ubuntu environment management, diagnostics,
 and transactional storage from FUCC 0.0.1, a local independent extraction of
@@ -10,3 +10,6 @@ FUCC 0.0.2 replaces the TypeScript implementation and retains FUCC's v1 durable
 formats, paths, immutable restoration baseline, and command-line interface.
 No Windows backend, GUI, Tauri shell, or Node runtime is included.
 Runtime dependencies have their own licenses: jcs (Apache-2.0), wcwidth (MIT).
+
+FUCC 0.0.3 adds Firefox policy management and guarded v3 resource enrollment,
+preserving existing restoration baselines while extending active configurations.

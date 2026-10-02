@@ -231,6 +231,32 @@ def test_sandbox_hidden_and_symlink_entries_report_unsupported(context):
     assert not any(item.id.startswith("desktop.") for item in app.resources)
 
 
+def test_firefox_native_is_enrolled_without_replacing_other_saved_bindings(context):
+    _, applications, _ = context
+    put(applications / "firefox.desktop", '[Desktop Entry]\nName=Firefox\nExec=/usr/lib/firefox/firefox %u\nDBusActivatable=true\n')
+    put(applications / "com.microsoft.VSCode.desktop", '[Desktop Entry]\nName=Visual Studio Code\nExec=/usr/share/code/code %F\n')
+    frozen = adapters(context, managed_desktop_files=[])
+    assert not any(item.id.startswith("desktop.") for item in frozen.resources)
+    candidate = adapters(context, managed_desktop_files=[], enroll_firefox=True)
+    assert [item.id for item in candidate.resources if item.id.startswith("desktop.")] == ["desktop.firefox.desktop"]
+    value = candidate.desired("us")["desktop.firefox.desktop"]["text"]
+    assert 'DBusActivatable=false' in value and '%u' in value
+    assert next(app for app in candidate.applications if app["kind"] == "firefox")["supported"] is True
+    assert next(app for app in candidate.applications if app["kind"] == "vscode")["supported"] is False
+
+
+def test_firefox_snap_and_flatpak_do_not_receive_native_launcher(context):
+    _, applications, _ = context
+    put(applications / "firefox_firefox.desktop", '[Desktop Entry]\nName=Firefox\nExec=/snap/bin/firefox %u\nX-SnapInstanceName=firefox\n')
+    put(applications / "org.mozilla.firefox.desktop", '[Desktop Entry]\nName=Firefox\nExec=/usr/bin/flatpak run org.mozilla.firefox %u\nX-Flatpak=org.mozilla.firefox\n')
+    app = adapters(context, managed_desktop_files=[], enroll_firefox=True)
+    assert not any(item.id.startswith("desktop.") for item in app.resources)
+    firefox = [item for item in app.applications if item["kind"] == "firefox"]
+    assert len(firefox) == 2 and not any(item["supported"] for item in firefox)
+    assert any("机器策略" in item["reason"] for item in firefox)
+    assert any("Flatpak" in item["reason"] for item in firefox)
+
+
 def test_launcher_runs_with_empty_path_and_quoted_home(context):
     home, _, _ = context
     app = adapters(context)

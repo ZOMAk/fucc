@@ -149,3 +149,72 @@ def test_root_session_rejected_before_state_creation(tmp_path, monkeypatch):
         LocalRuntime({"HOME": str(tmp_path)})
     assert exc.value.exit_code == 10
     assert list(tmp_path.iterdir()) == []
+
+
+def test_upgrade_enrolls_native_firefox_and_preserves_existing_originals(local):
+    runtime, env, machine, apps, locales = local
+    runtime.on("us", user_only=True, timezone="America/Los_Angeles")
+    old = json.loads((runtime.root / "local-transaction.json").read_text())["payload"]
+    assert old["version"] == 2
+    original = {entry["id"]: entry["original"] for entry in old["committed"]["resources"]}
+    (apps / "firefox.desktop").write_text('[Desktop Entry]\nName=Firefox\nExec=/usr/lib/firefox/firefox %u\n')
+    resumed = LocalRuntime(env, [str(apps)], machine, locales)
+    assert resumed.status()["health"] == "healthy"
+    assert resumed.on("us", user_only=True, timezone="America/Los_Angeles")["kind"] == "committed"
+    ledger = json.loads((resumed.root / "local-transaction.json").read_text())["payload"]
+    assert ledger["version"] == 3
+    assert {entry["id"]: entry["original"] for entry in ledger["committed"]["resources"] if entry["id"] in original} == original
+    firefox = next(app for app in resumed.status()["applications"] if app["kind"] == "firefox")
+    assert firefox["managed"] and firefox["configurationAligned"]
+    assert resumed.on("us", user_only=True, timezone="America/Los_Angeles")["kind"] == "noop"
+    override = Path(env["HOME"]) / ".local/share/applications/firefox.desktop"
+    assert override.exists() and not machine.writes
+    assert resumed.off()["kind"] == "restored" and not override.exists()
+    assert (Path(env["HOME"]) / ".bashrc").read_text() == "# daily settings\nexport OTHER=value\n"
+
+
+def test_failed_firefox_enrollment_restores_previous_binding_set(local):
+    runtime, env, machine, apps, locales = local
+    runtime.on("us", user_only=True)
+    previous = runtime.status()["resources"]
+    (apps / "firefox.desktop").write_text('[Desktop Entry]\nName=Firefox\nExec=/usr/lib/firefox/firefox %u\n')
+    resumed = LocalRuntime(env, [str(apps)], machine, locales)
+    machine.fail = True
+    assert resumed.on("us")["kind"] == "compensated"
+    assert resumed.status()["health"] == "healthy"
+    assert resumed.status()["resources"] == previous
+    assert not (Path(env["HOME"]) / ".local/share/applications/firefox.desktop").exists()
+    assert resumed.off()["kind"] == "restored"
+
+
+def test_recover_interrupted_firefox_enrollment_reloads_previous_bindings(local, monkeypatch):
+    from fucc import apps as app_module
+
+    runtime, env, machine, apps, locales = local
+    runtime.on("us", user_only=True)
+    previous = runtime.status()["resources"]
+    (apps / "firefox.desktop").write_text('[Desktop Entry]\nName=Firefox\nExec=/usr/lib/firefox/firefox %u\n')
+    create_snapshot = app_module.snapshot_resource
+    interrupted = [False]
+
+    def snapshot(resource_id, path):
+        value = create_snapshot(resource_id, path)
+        original_write = value.write
+
+        def write(desired):
+            original_write(desired)
+            if resource_id == "desktop.firefox.desktop" and not interrupted[0]:
+                interrupted[0] = True
+                raise KeyboardInterrupt("fixture power loss after Firefox desktop override")
+
+        value.write = write
+        return value
+
+    monkeypatch.setattr(app_module, "snapshot_resource", snapshot)
+    resumed = LocalRuntime(env, [str(apps)], machine, locales)
+    with pytest.raises(KeyboardInterrupt):
+        resumed.on("us", user_only=True)
+    recovering = LocalRuntime(env, [str(apps)], machine, locales)
+    assert recovering.recover()["kind"] == "recovered"
+    assert recovering.status()["health"] == "healthy" and recovering.status()["resources"] == previous
+    assert recovering.off()["kind"] == "restored"

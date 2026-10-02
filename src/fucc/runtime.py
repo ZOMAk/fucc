@@ -47,10 +47,19 @@ class LocalRuntime:
                                         [entry for entry in bindings if entry["id"].startswith("desktop.")] if bindings else None)
         self.machine = machine if machine is not None else MachineAdapter(
             str(Path(__file__).with_name("helper.py")), sys.executable, self.environment)
+        self.transaction = self._transaction(self.user)
+
+    def _transaction(self, user):
         resource = Resource("bash-profile", str(persist_root(self.environment)), self._read_bash, self._write_bash,
                             lambda value: {"region": None})
-        self.transaction = LocalTransaction(self.root, [resource, *self.user.resources, self.machine.resource],
-                                            before_recover=self._recover_nested)
+        return LocalTransaction(self.root, [resource, *user.resources, self.machine.resource],
+                                before_recover=self._recover_nested)
+
+    def _reload_bindings(self):
+        bindings = read_resource_bindings(self.root)
+        self.user = create_user_adapters(self.environment, self.application_dirs,
+                                        [entry for entry in bindings if entry["id"].startswith("desktop.")] if bindings else None)
+        self.transaction = self._transaction(self.user)
 
     def _read_bash(self):
         status = self.bash.status()
@@ -107,17 +116,35 @@ class LocalRuntime:
         profile = get_target_region(target, timezone)
         dynamic = profile["timezone"] != get_target_region(target)["timezone"]
         assert_locale(target, self.list_locales)
+        bindings = read_resource_bindings(self.root)
+        candidate = create_user_adapters(self.environment, self.application_dirs,
+                                        [entry for entry in bindings if entry["id"].startswith("desktop.")] if bindings else None,
+                                        enroll_firefox=True)
+        enrollment = {entry.id for entry in candidate.resources} != {entry.id for entry in self.user.resources}
+        if enrollment:
+            self.user = candidate
+            self.transaction = self._transaction(self.user)
         desired = {**self.user.desired(target, profile["timezone"]),
                    "bash-profile": {"region": target, **({"timezone": profile["timezone"]} if dynamic else {})},
                    self.machine.resource.id: self.machine.resource.read() if user_only else
                    self.machine.desired(target, profile["timezone"]) if dynamic else self.machine.desired(target)}
-        return self.transaction.apply(target, desired, wire_version=2 if dynamic else 1)
+        firefox = desired[self.machine.resource.id].get("firefox") is True or any(
+            app["kind"] == "firefox" and app["supported"] for app in self.user.applications)
+        result = self.transaction.apply(target, desired, wire_version=3 if firefox else 2 if dynamic else 1,
+                                        enroll=enrollment)
+        if enrollment:
+            # A compensated enrollment publishes the previous, smaller resource set.
+            self._reload_bindings()
+        return result
 
     def off(self):
         return self.transaction.restore()
 
     def recover(self):
-        return self.transaction.recover()
+        result = self.transaction.recover()
+        if result["kind"] != "recovery_required":
+            self._reload_bindings()
+        return result
 
     def status(self):
         saved = self.transaction.status()
@@ -154,7 +181,7 @@ class LocalRuntime:
                              "machineConfigurationVerified": machine["health"] == "healthy", "applicationRuntimeVerified": False},
                 "paths": self.user.paths,
                 "activation": {
-                    "applications": "完全退出 Chrome、VS Code 和 Claude Desktop 后，从桌面入口重新启动；VS Code 新窗口可能复用旧进程。" if saved["active"] else "未开启统一配置。关闭后已运行的应用需完全退出后重开。",
+                    "applications": "完全退出 Chrome、Firefox、VS Code 和 Claude Desktop 后，从桌面入口重新启动；VS Code 新窗口可能复用旧进程。" if saved["active"] else "未开启统一配置。关闭后已运行的应用需完全退出后重开。",
                     "terminal": "新开交互式 Bash，或加载 bash.activation 给出的 env.sh。" if saved["active"] else "关闭后从桌面重新打开终端，已有父终端可能仍保留旧环境。",
                     "session": "environment.d 覆盖下次登录后的用户服务；已有桌面会话和进程不会自动更换环境，完整会话更新需要注销后登录。",
                     "verifiedRunningApplications": False}}

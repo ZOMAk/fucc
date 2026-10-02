@@ -7,6 +7,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
+from . import __version__
 from .paths import xdg_directory
 
 DATACENTERS = {"AS16509", "AS14618", "AS8075", "AS15169", "AS396982", "AS13335", "AS14061", "AS37963", "AS45090", "AS36351", "AS20473", "AS63949", "AS51167", "AS9009", "AS212238"}
@@ -66,7 +67,7 @@ def fetch_json(url, environment=None):
     proxy = env.get("https_proxy") or env.get("HTTPS_PROXY") or env.get("http_proxy") or env.get("HTTP_PROXY")
     handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {})
     opener = urllib.request.build_opener(handler)
-    with opener.open(urllib.request.Request(url, headers={"User-Agent": "FUCC/0.0.2"}), timeout=5) as response:
+    with opener.open(urllib.request.Request(url, headers={"User-Agent": f"FUCC/{__version__}"}), timeout=5) as response:
         payload = response.read(1024 * 1024 + 1)
         if len(payload) > 1024 * 1024:
             raise ValueError("Response exceeded size limit")

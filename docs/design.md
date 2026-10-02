@@ -1,4 +1,4 @@
-# FUCC 0.0.2 实现说明
+# FUCC 0.0.3 实现说明
 
 | 模块 | 职责 |
 |---|---|
@@ -8,12 +8,13 @@
 | apps / jsonc | 会话、launcher、设置及桌面覆盖；JSONC token 精确编辑 |
 | files | 安全快照、期望值比较、原子替换与 fsync |
 | machine / helper | 固定机器目录/命令、UID 授权、策略冲突与提权 |
+| firefox | 原生 / Snap 能力发现、严格政策解析与 Firefox Preferences 合并 |
 | state | JCS 校验封装、前代、dirfd/nofollow、Linux 进程锁 |
-| transaction | v1/v2 资源绑定、原始值、两代写前日志与补偿 |
+| transaction | v1/v2/v3 资源绑定、原始值、两代写前日志与补偿 |
 | detection / network | 只读检测、ZoneInfo、IP 多源与凭据隐藏 |
 | regions / paths / errors | 地区数据、美国 IANA 时区选择、HOME/XDG 和稳定错误 |
 
-产品名、命令与状态路径仍为 `fucc`，源码目录为 `fucc2`，Conda 环境为 `fucc`，版本保持 `0.0.2`。兼容 0.0.1 的 v1 状态；美国非默认时区增加 v2 状态保护。checked envelope 的 SHA-256 输入遵循原 ECMAScript 数字格式和 UTF-16 属性排序，以 JCS 实现；拒绝不安全数字、非有限数、孤立 surrogate 和非 JSON 值。
+产品名、命令与状态路径仍为 `fucc`，源码目录为 `fucc2`，Conda 环境为 `fucc`，版本为 `0.0.3`。兼容 0.0.1 的 v1 状态及 0.0.2 的动态时区 v2 状态；增加 Firefox 使用 v3 状态保护。checked envelope 的 SHA-256 输入遵循原 ECMAScript 数字格式和 UTF-16 属性排序，以 JCS 实现；拒绝不安全数字、非有限数、孤立 surrogate 和非 JSON 值。
 
 统一 coordinator 为资源绑定 id/identity，首次开启记录 original，切换仅改 desired。Bash baseline 为 daily，统一本机 off 会关闭以前单独开启的 Bash。桌面从保存绑定恢复集合，卸载不会丢原始快照。
 
@@ -51,3 +52,24 @@ JSON 顶层 `network` 与配置 `status` 分开，增加 `timezone` 和逐来源
 通用事务完全恢复到空状态、或初次 apply 失败并完整补偿后，可双代写回空的 v1。Bash 在关闭后仍保留 v2，保留与其原始快照及日志关联的保护；因此使用过动态时区后，整个项目不能假定与旧 TypeScript 版本互操作，应继续用本 Python 版本管理。历史 v1 默认配置仍可迁移、恢复；不删除备份或强制转换状态。
 
 测试以旧模块验证 v1 跨语言格式与恢复、v2 拒绝旧版写入；fixture 验证 IP 时区选择、回退、夏令时、城市切换补偿、注释保留、外部修改、锁竞争和写入/fsync 故障。运行时无 Node 依赖。
+
+## Firefox 与 0.0.3 升级
+
+Firefox 使用 `/etc/firefox/policies/policies.json` 的 `policies.Preferences`，锁定以下四项：
+
+| Preference | 美国配置 |
+|---|---|
+| `intl.accept_languages` | `en-US,en` |
+| `media.peerconnection.ice.default_address_only` | `true` |
+| `media.peerconnection.ice.no_host` | `true` |
+| `media.peerconnection.ice.proxy_only_if_behind_proxy` | `true` |
+
+这三个 ICE 偏好采用 [Firefox WebExtension 的官方映射](https://github.com/mozilla-firefox/firefox/blob/main/toolkit/components/extensions/parent/ext-privacy.js)，限制地址暴露并在网页实际使用浏览器代理时限制 ICE 连接。它们不配置代理路由，不关闭 WebRTC，也不保证透明代理下全部直连 UDP 被阻断。FUCC 保留其他 Preferences、策略、WebRTC 开关和抗指纹设置；抗指纹保护可能向网页报告 UTC。
+
+原生安装与确认已连接 `etc-firefox` 的 Snap 使用宿主策略。发现过程只读检查可信文件和固定 `/usr/bin/snap connections firefox`，不会执行浏览器或自动连接接口。Flatpak 暂不支持。原生桌面入口通过用户 launcher 加载环境，Snap 不注入 launcher 环境；系统时区和机器策略仍覆盖它。`--user-only` 不更新机器策略。
+
+Firefox 优先读取 `/etc` 策略，不与安装目录的 `distribution/policies.json` 合并。发现既有 distribution 策略但尚无 `/etc` 文件时，FUCC 拒绝新增该策略文件并在状态中说明，避免遮蔽现有策略。政策文件有重复 JSON 键、错误结构、链接、特殊文件或不可信路径时同样拒绝修改。合并保留无关内容，整份原始文件及权限由私有机器事务保存；关闭时精确还原，未知外部修改阻止覆盖。配置文件对齐仍不代表浏览器已接受策略，需完全退出重开，在 `about:policies` 的 Active / Errors 核实。
+
+0.0.2 的活动配置可通过再次 `on` 添加 Firefox，无需关闭或重采旧资源的 original。通用事务的 `enroll=True` 只允许 id/identity 不变的严格扩展；写入前双代发布 `fucc-local-transaction-v3`。`status/off/recover` 从已保存绑定构造精确集合，浏览器卸载也不丢失还原快照。中断添加时恢复旧集合；补偿后重新读取绑定，避免使用添加时的候选集合误判状态。
+
+机器新增 `policy.firefox` 和私有 `firefox-profile` 资源，公开 `fucc-machine-public-v3` 的 `firefoxManaged` 只表示已提交的管理目标。外层在机器提交后失败时，机器将 Firefox desired 还原至首次 original，标记关闭，但保留登记和原始快照；后续重新开启不再采集基线。完整 off 才恢复全部 original。Python 0.0.2 拒绝 v3 的活动和中断状态，避免旧版误读扩展资源；接入后继续使用 0.0.3。

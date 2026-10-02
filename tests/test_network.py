@@ -116,7 +116,7 @@ def test_fetch_has_proxy_precedence_timeout_and_response_bound(monkeypatch):
 
     monkeypatch.setattr(network.urllib.request, "build_opener", build)
     assert network.fetch_json("https://example.test", {"https_proxy": "http://first", "HTTPS_PROXY": "http://second", "HTTP_PROXY": "http://third"}) == {"ip": "203.0.113.1"}
-    assert observed == {"proxies": {"http": "http://first", "https": "http://first"}, "timeout": 5, "agent": "FUCC/0.0.2", "limit": 1024 * 1024 + 1}
+    assert observed == {"proxies": {"http": "http://first", "https": "http://first"}, "timeout": 5, "agent": "FUCC/0.0.3", "limit": 1024 * 1024 + 1}
     monkeypatch.setattr(Response, "read", lambda self, limit: b"x" * limit)
     with pytest.raises(ValueError, match="size limit"):
         network.fetch_json("https://example.test", {})

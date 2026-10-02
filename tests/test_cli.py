@@ -199,14 +199,14 @@ def test_preference_status_and_plain_table(environment, capsys):
     assert parsed(capsys)["preferredRegion"] == "eu"
     assert cli.main(["region", "list"]) == 0
     output = capsys.readouterr().out
-    assert "FUCC 0.0.2" in output and "Europe/London" in output
+    assert "FUCC 0.0.3" in output and "Europe/London" in output
     assert all(character not in output for character in "✅⚠️╔║")
     assert cli.main(["region", "status", "--json"]) == 0
     assert parsed(capsys)["activeRegion"] is None
 
 
 def test_helper_json_and_public_errors(environment, capsys, monkeypatch):
-    monkeypatch.setattr(cli, "run_machine_action", lambda *args: {"scope": "machine", "active": False})
+    monkeypatch.setattr(cli, "run_machine_action", lambda *args, **kwargs: {"scope": "machine", "active": False})
     assert cli.main(["__machine", "status", "--owner", "1000"]) == 0
     assert parsed(capsys)["scope"] == "machine"
     def fail(options):

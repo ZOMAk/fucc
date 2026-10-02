@@ -119,12 +119,7 @@ def _local_rows(status, network, selection=None):
         *((key, (status["configured"] or {}).get(key, "none")) for key in ("TZ", "LANG", "LC_ALL")),
         ("Resources aligned", f"{sum(item['aligned'] for item in status['resources'])}/{len(status['resources'])}"),
         ("Machine profile", f"{status['machine']['region'] if status['machine']['active'] else 'off / unknown'}; {status['machine']['health']}"),
-        ("System timezone", status["machine"]["actualTimezone"] or "unknown"),
-        ("Browser policies", "; ".join(f"{browser['label']}: {'conflict' if browser['configurationAligned'] is False else browser['effectivePolicy']}" for browser in status["machine"]["browsers"] if browser["installation"] != "not_installed") or "none"),
-        ("Desktop entries", "; ".join(f"{app['name']}: {'conflict' if app['managed'] and app['configurationAligned'] is False else 'configured' if app['supported'] and app['managed'] else 'available' if app['supported'] else app.get('reason', 'unsupported')}" for app in status["applications"])),
-        ("Configuration scope", f"{status['coverage']['claudeSettings']} {status['coverage']['vscodeSettings']}"),
-        ("Applications", status["activation"]["applications"]), ("Terminal", status["activation"]["terminal"]),
-        ("Desktop session", status["activation"]["session"])]
+        ("System timezone", status["machine"]["actualTimezone"] or "unknown")]
 
 
 def _bash_rows(status):
@@ -320,10 +315,12 @@ def _machine(arguments):
     root.add_argument("--owner", required=True)
     root.add_argument("--region")
     root.add_argument("--timezone")
+    root.add_argument("--firefox", choices=("on", "off"), default="off")
     options = root.parse_args(arguments)
     if not options.owner.isascii() or not options.owner.isdigit() or int(options.owner) > 9007199254740991:
         raise FuccError("Invalid owner UID", "INVALID_COMMAND", 10)
     json_output(run_machine_action(options.action, options.region, int(options.owner),
+                                   firefox=options.firefox == "on",
                                    **({"timezone": options.timezone} if options.timezone is not None else {})))
     return 0
 

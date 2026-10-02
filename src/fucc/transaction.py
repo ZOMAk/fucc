@@ -1,4 +1,4 @@
-"""Recoverable resources with compatible v1 and guarded v2 state formats."""
+"""Recoverable resources with guarded v2 targets and v3 resource enrollment."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,7 +13,8 @@ from .state import (MutationLock, _Boundary, _decode, _parse_json, canonical_jso
 
 SCHEMA = "fucc-local-transaction-v1"
 SCHEMA_V2 = "fucc-local-transaction-v2"
-SCHEMAS = {1: SCHEMA, 2: SCHEMA_V2}
+SCHEMA_V3 = "fucc-local-transaction-v3"
+SCHEMAS = {1: SCHEMA, 2: SCHEMA_V2, 3: SCHEMA_V3}
 MARKER_SCHEMA = "fucc-local-transaction-initialized-v1"
 EMPTY = {"region": None, "revision": 0, "resources": []}
 REGIONS = ("us", "eu", "jp", "sg")
@@ -84,6 +85,13 @@ def _targets(left: list[Any], right: list[Any]) -> bool:
     return len(left) == len(right) and all(key(a) == key(b) for a, b in zip(left, right))
 
 
+def _subset_targets(left: list[Any], right: list[Any]) -> bool:
+    def key(value: Any) -> tuple[str, str]:
+        return (value["id"], value["identity"]) if type(value) is dict else (value.id, value.identity)
+    candidates = dict(key(value) for value in right)
+    return all(candidates.get(id) == identity for id, identity in map(key, left))
+
+
 def valid_document(value: Any) -> bool:
     if (not _exact(value, ("version", "committed", "journal"))
             or type(value["version"]) not in (int, float) or value["version"] not in SCHEMAS
@@ -110,6 +118,14 @@ def valid_document(value: Any) -> bool:
         return False
     if previous["region"] is None:
         return True
+    if value["version"] == 3:
+        if not _subset_targets(previous["resources"], target["resources"]):
+            return False
+        entries_by_id = {entry["id"]: entry for entry in entries}
+        target_by_id = {resource["id"]: resource for resource in target["resources"]}
+        return all(_equal(entries_by_id[before["id"]]["before"], before["desired"])
+                   and _equal(before["original"], target_by_id[before["id"]]["original"])
+                   for before in previous["resources"])
     return (_targets(previous["resources"], target["resources"])
             and all(_equal(entry["before"], before["desired"]) and _equal(before["original"], after["original"])
                     for entry, before, after in zip(entries, previous["resources"], target["resources"])))
@@ -141,7 +157,7 @@ def _generation(boundary: _Boundary, name: str) -> dict[str, Any]:
         # _Boundary retains the no-follow, dirfd and directory-identity checks.
         payload = _decode(text, schema, None)
         version = payload.get("version") if type(payload) is dict else None
-        if schema not in SCHEMAS.values() or type(version) in (int, float) and version > 2:
+        if schema not in SCHEMAS.values() or type(version) in (int, float) and version > max(SCHEMAS):
             raise _UnsupportedWire()
         if not valid_document(payload) or SCHEMAS[payload["version"]] != schema:
             return {"kind": "corrupt"}
@@ -220,7 +236,7 @@ def read_committed_target(root: str | Path) -> dict[str, str] | None:
             raise _unsafe()
         try:
             profile = get_target_region(snapshot["region"], desired.get("timezone"))
-            if "timezone" in desired and (document["version"] != 2 or type(desired["timezone"]) is not str
+            if "timezone" in desired and (document["version"] < 2 or type(desired["timezone"]) is not str
                                            or profile["timezone"] != desired["timezone"]
                                            or profile["timezone"] == get_target_region(snapshot["region"])["timezone"]):
                 raise _unsafe()
@@ -267,7 +283,7 @@ class LocalTransaction:
     def __init__(self, root: str | Path, resources: Iterable[Resource],
                  before_recover: Callable[[], None] | None = None, wire_version: int = 1):
         if type(wire_version) is not int or wire_version not in SCHEMAS:
-            raise FuccError("Local transaction wire version must be 1 or 2")
+            raise FuccError("Local transaction wire version must be 1, 2 or 3")
         self.wire_version = wire_version
         self._effective_wire_version = wire_version
         self.root = checked_root(root)
@@ -286,9 +302,9 @@ class LocalTransaction:
         version = 1 if inactive else self._effective_wire_version
         payload = {**document, "version": version}
         write_checked(self.root, self.path, SCHEMAS[version], payload, valid_document)
-        if inactive and self._effective_wire_version == 2:
+        if inactive and self._effective_wire_version >= 2:
             # A completed restore (or initial apply compensation) proves the
-            # baseline is restored. Remove v2 from both generations before an
+            # baseline is restored. Remove newer formats from both generations before an
             # older runtime is allowed to capture a fresh baseline again.
             write_checked(self.root, self.path, SCHEMA, payload, valid_document)
 
@@ -308,19 +324,27 @@ class LocalTransaction:
         return snapshot["region"] is None or _targets(snapshot["resources"], self.resources)
 
     def _journal_bound(self, journal: dict[str, Any]) -> bool:
+        previous_bound = self._bound(journal["previous"])
+        if not previous_bound and self._effective_wire_version == 3 and journal["kind"] == "apply":
+            previous_bound = _subset_targets(journal["previous"]["resources"], journal["entries"])
         return (_targets(journal["entries"], self.resources)
-                and self._bound(journal["previous"]) and self._bound(journal["target"]))
+                and previous_bound and self._bound(journal["target"]))
+
+    def _document_bound(self, document: dict[str, Any]) -> bool:
+        journal = document["journal"]
+        return self._bound(document["committed"]) if journal is None else self._journal_bound(journal)
 
     @staticmethod
     def _read(resource: Resource) -> Any:
         return clone_json(resource.read())
 
-    def _actual(self, snapshot: dict[str, Any]) -> list[Any]:
-        if not self._bound(snapshot):
+    def _actual(self, snapshot: dict[str, Any], *, enroll: bool = False) -> list[Any]:
+        if not self._bound(snapshot) and not (enroll and _subset_targets(snapshot["resources"], self.resources)):
             raise _unsafe()
         actual = [self._read(resource) for resource in self.resources]
-        if snapshot["region"] is not None and any(not _equal(value, expected["desired"])
-                                                  for value, expected in zip(actual, snapshot["resources"])):
+        actual_by_id = {resource.id: value for resource, value in zip(self.resources, actual)}
+        if snapshot["region"] is not None and any(not _equal(actual_by_id[expected["id"]], expected["desired"])
+                                                  for expected in snapshot["resources"]):
             raise _unsafe()
         return actual
 
@@ -387,9 +411,12 @@ class LocalTransaction:
         finally:
             lock.release()
 
-    def apply(self, region: str, desired: dict[str, Any], *, wire_version: int | None = None) -> dict[str, str]:
+    def apply(self, region: str, desired: dict[str, Any], *, wire_version: int | None = None,
+              enroll: bool = False) -> dict[str, str]:
+        if type(enroll) is not bool:
+            raise FuccError("Local transaction enrollment must be explicitly enabled or disabled")
         if wire_version is not None and (type(wire_version) is not int or wire_version not in SCHEMAS):
-            raise FuccError("Local transaction wire version must be 1 or 2")
+            raise FuccError("Local transaction wire version must be 1, 2 or 3")
         if (type(region) is not str or region not in REGIONS or not is_safe_json(desired)
                 or not _exact(desired, (resource.id for resource in self.resources))):
             raise FuccError("Local environment target must contain one JSON value for every managed resource")
@@ -400,21 +427,23 @@ class LocalTransaction:
                 document, degraded = self._load()
                 if degraded or document is not None and document["journal"] is not None:
                     return {"kind": "recovery_required"}
-                self._effective_wire_version = max(self._effective_wire_version, wire_version or self.wire_version)
-                before = self._actual(document["committed"] if document is not None else EMPTY)
+                self._effective_wire_version = max(self._effective_wire_version, wire_version or self.wire_version,
+                                                   3 if enroll else 1)
+                before = self._actual(document["committed"] if document is not None else EMPTY, enroll=enroll)
                 if document is None:
                     document = self._initialize()
             except Exception:
                 return {"kind": "recovery_required"}
             previous = document["committed"]
-            if previous["region"] == region and all(_equal(value, target_values[resource.id])
+            if self._bound(previous) and previous["region"] == region and all(_equal(value, target_values[resource.id])
                                                       for resource, value in zip(self.resources, before)):
                 return {"kind": "noop"}
             try:
+                old_resources = {resource["id"]: resource for resource in previous["resources"]}
                 target = {"region": region, "revision": previous["revision"] + 1, "resources": [
                     {"id": resource.id, "identity": resource.identity,
                      "original": clone_json(resource.baseline(clone_json(before[index])) if resource.baseline is not None else before[index])
-                     if previous["region"] is None else clone_json(previous["resources"][index]["original"]),
+                     if resource.id not in old_resources else clone_json(old_resources[resource.id]["original"]),
                      "desired": target_values[resource.id]}
                     for index, resource in enumerate(self.resources)]}
             except Exception:
@@ -459,8 +488,7 @@ class LocalTransaction:
         def action() -> dict[str, str]:
             try:
                 document, degraded = self._load()
-                if document is not None and (not self._bound(document["committed"])
-                                             or document["journal"] is not None and not self._journal_bound(document["journal"])):
+                if document is not None and not self._document_bound(document):
                     return {"kind": "recovery_required"}
                 if self.before_recover is not None:
                     self.before_recover()
@@ -469,7 +497,7 @@ class LocalTransaction:
                 return {"kind": "recovery_required"}
             if document is None:
                 return {"kind": "noop"}
-            if not self._bound(document["committed"]):
+            if not self._document_bound(document):
                 return {"kind": "recovery_required"}
             if document["journal"] is None:
                 if degraded:
@@ -494,7 +522,7 @@ class LocalTransaction:
             return {"region": None, "health": "healthy", "transaction": "none", "revision": 0, "active": False,
                     "resources": [{"id": item.id, "identity": item.identity, "aligned": True} for item in self.resources]}
         committed, journal = document["committed"], document["journal"]
-        binding_valid = self._bound(committed) and (journal is None or self._journal_bound(journal))
+        binding_valid = self._document_bound(document)
         summaries = []
         for resource in self.resources:
             expected = next((item for item in committed["resources"] if item["id"] == resource.id and item["identity"] == resource.identity), None)
@@ -510,14 +538,21 @@ class LocalTransaction:
                 "health": "recovery_required" if degraded or journal is not None or not binding_valid else
                 "healthy" if all(item["aligned"] for item in summaries) else "degraded"}
 
-    def committed_desired(self, resource_id: str) -> Any | None:
-        """Return only a checked committed target, never its saved baseline."""
+    def _committed_value(self, resource_id: str, field: str) -> Any | None:
         if not _id(resource_id):
             raise _unsafe()
         document, degraded = self._load()
         if document is None:
             return None
-        committed, journal = document["committed"], document["journal"]
-        if degraded or not self._bound(committed) or journal is not None and not self._journal_bound(journal):
+        committed = document["committed"]
+        if degraded or not self._document_bound(document):
             raise _unsafe()
-        return next((clone_json(item["desired"]) for item in committed["resources"] if item["id"] == resource_id), None)
+        return next((clone_json(item[field]) for item in committed["resources"] if item["id"] == resource_id), None)
+
+    def committed_desired(self, resource_id: str) -> Any | None:
+        """Return only a checked committed target, never its saved baseline."""
+        return self._committed_value(resource_id, "desired")
+
+    def committed_original(self, resource_id: str) -> Any | None:
+        """Read a checked baseline for an internal adapter; never expose in CLI."""
+        return self._committed_value(resource_id, "original")
