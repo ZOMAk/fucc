@@ -1,0 +1,12 @@
+FUCC (Fix You, Claude Code) 0.0.2
+
+This Python implementation derives Ubuntu environment management, diagnostics,
+and transactional storage from FUCC 0.0.1, a local independent extraction of
+CC-Fix 0.2.0-rc.2 plus its Ubuntu adaptation.
+CC-Fix upstream: https://github.com/gongyijie85/cc-fix
+The upstream copyright and permission notice is retained in LICENSE.
+
+FUCC 0.0.2 replaces the TypeScript implementation and retains FUCC's v1 durable
+formats, paths, immutable restoration baseline, and command-line interface.
+No Windows backend, GUI, Tauri shell, or Node runtime is included.
+Runtime dependencies have their own licenses: jcs (Apache-2.0), wcwidth (MIT).

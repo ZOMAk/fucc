@@ -1,0 +1,4 @@
+include LICENSE NOTICE README.md environment.yml requirements*.txt
+recursive-include scripts fucc
+recursive-include docs *.md
+recursive-include tests *.py
