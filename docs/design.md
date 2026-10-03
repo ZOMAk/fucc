@@ -1,4 +1,4 @@
-# FUCC 0.0.3 实现说明
+# FUCC 0.0.4 实现说明
 
 | 模块 | 职责 |
 |---|---|
@@ -14,7 +14,7 @@
 | detection / network | 只读检测、ZoneInfo、IP 多源与凭据隐藏 |
 | regions / paths / errors | 地区数据、美国 IANA 时区选择、HOME/XDG 和稳定错误 |
 
-产品名、命令与状态路径仍为 `fucc`，源码目录为 `fucc2`，Conda 环境为 `fucc`，版本为 `0.0.3`。兼容 0.0.1 的 v1 状态及 0.0.2 的动态时区 v2 状态；增加 Firefox 使用 v3 状态保护。checked envelope 的 SHA-256 输入遵循原 ECMAScript 数字格式和 UTF-16 属性排序，以 JCS 实现；拒绝不安全数字、非有限数、孤立 surrogate 和非 JSON 值。
+产品名、命令与状态路径仍为 `fucc`，源码目录为 `fucc2`，Conda 环境为 `fucc`，版本为 `0.0.4`。兼容 0.0.1 的 v1 状态及 0.0.2 的动态时区 v2 状态；增加 Firefox 使用 v3 状态保护。checked envelope 的 SHA-256 输入遵循原 ECMAScript 数字格式和 UTF-16 属性排序，以 JCS 实现；拒绝不安全数字、非有限数、孤立 surrogate 和非 JSON 值。
 
 统一 coordinator 为资源绑定 id/identity，首次开启记录 original，切换仅改 desired。Bash baseline 为 daily，统一本机 off 会关闭以前单独开启的 Bash。桌面从保存绑定恢复集合，卸载不会丢原始快照。
 
@@ -73,3 +73,13 @@ Firefox 优先读取 `/etc` 策略，不与安装目录的 `distribution/policie
 0.0.2 的活动配置可通过再次 `on` 添加 Firefox，无需关闭或重采旧资源的 original。通用事务的 `enroll=True` 只允许 id/identity 不变的严格扩展；写入前双代发布 `fucc-local-transaction-v3`。`status/off/recover` 从已保存绑定构造精确集合，浏览器卸载也不丢失还原快照。中断添加时恢复旧集合；补偿后重新读取绑定，避免使用添加时的候选集合误判状态。
 
 机器新增 `policy.firefox` 和私有 `firefox-profile` 资源，公开 `fucc-machine-public-v3` 的 `firefoxManaged` 只表示已提交的管理目标。外层在机器提交后失败时，机器将 Firefox desired 还原至首次 original，标记关闭，但保留登记和原始快照；后续重新开启不再采集基线。完整 off 才恢复全部 original。Python 0.0.2 拒绝 v3 的活动和中断状态，避免旧版误读扩展资源；接入后继续使用 0.0.3。
+
+## Claude Desktop 入口与已还原资源
+
+本机 Claude Desktop 会从系统模板重新生成含 `X-Claude-Generated=true` 的用户桌面入口，可能把 FUCC 的启动包装替换回开启前的文件。客户端明确把不含该生成标记的已有入口视为用户自定义入口，跳过重写后继续运行。FUCC 管理该类入口时停用生成标记，保留原始启动命令和快捷动作；完整关闭按首次 snapshot 精确恢复文件与权限，包括原始生成标记。管理期间客户端不会自动更新该用户入口的标题或快捷菜单。此适配只涉及用户桌面文件，不修改客户端程序、系统模板或账号数据。
+
+关闭预检要求有效已保存状态和精确资源绑定，每项当前值必须等于已提交的 `desired` 或不可变 `original`。已经是 original 的资源视为已还原，写入阶段跳过该项；其余资源照常恢复。任一未知值仍在发布恢复日志前拒绝，不覆盖外部修改。`on` 继续只接受当前 desired，无日志的 `recover` 继续只核验，不自动覆盖或选择新的基线。
+
+恢复日志保持 v1/v2/v3 格式，`before` 仍保存已提交 desired，目标为 original。既有写入逻辑接受这两个已知值，因此能继续处理中断恢复的混合状态，也不会重写已经恢复的原始文件。用户整文件资源写入沿用最近一次读取并校验的快照作为原子替换的 expected，校验后发生的未知编辑不会被一次新的读取升级为可覆盖的预期值。
+
+已有旧版受管入口仍对齐时，再次 `on` 可提交停用生成标记的新包装，首次 original 不变。若客户端已经将入口精确恢复为 original，应先完全退出客户端并执行 `off`，再开启 FUCC；不放宽 `on` 的冲突检查。此修补自 `0.0.3` 起支持，`0.0.4` 沿用现有状态和备份，无需转换或删除。

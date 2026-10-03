@@ -183,5 +183,5 @@ class LocalRuntime:
                 "activation": {
                     "applications": "完全退出 Chrome、Firefox、VS Code 和 Claude Desktop 后，从桌面入口重新启动；VS Code 新窗口可能复用旧进程。" if saved["active"] else "未开启统一配置。关闭后已运行的应用需完全退出后重开。",
                     "terminal": "新开交互式 Bash，或加载 bash.activation 给出的 env.sh。" if saved["active"] else "关闭后从桌面重新打开终端，已有父终端可能仍保留旧环境。",
-                    "session": "environment.d 覆盖下次登录后的用户服务；已有桌面会话和进程不会自动更换环境，完整会话更新需要注销后登录。",
+                    "session": "environment.d 配置在下一次完整桌面会话启动时读取；已有会话和进程不会自动更换环境。",
                     "verifiedRunningApplications": False}}

@@ -199,7 +199,7 @@ def test_preference_status_and_plain_table(environment, capsys):
     assert parsed(capsys)["preferredRegion"] == "eu"
     assert cli.main(["region", "list"]) == 0
     output = capsys.readouterr().out
-    assert "FUCC 0.0.3" in output and "Europe/London" in output
+    assert f"FUCC {__version__}" in output and "Europe/London" in output
     assert all(character not in output for character in "✅⚠️╔║")
     assert cli.main(["region", "status", "--json"]) == 0
     assert parsed(capsys)["activeRegion"] is None

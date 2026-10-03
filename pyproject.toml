@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fucc"
-version = "0.0.3"
+version = "0.0.4"
 description = "Fix You, Claude Code — Ubuntu local Claude environment management"
 requires-python = ">=3.12"
 license = "MIT"

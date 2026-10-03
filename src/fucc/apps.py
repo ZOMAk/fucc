@@ -141,11 +141,24 @@ def vscode_resource(path: str) -> Resource:
 
 
 def snapshot_resource(resource_id: str, path: str) -> Resource:
+    verified: dict | None = None
+
+    def read() -> dict:
+        nonlocal verified
+        verified = read_snapshot(path)
+        return dict(verified)
+
     def write(value: Any) -> None:
+        nonlocal verified
         if not isinstance(value, dict) or set(value) != {"text", "mode"}:
             raise TypeError("Invalid managed file snapshot")
-        replace_snapshot(path, value, read_snapshot(path))
-    return Resource(resource_id, path, lambda: read_snapshot(path), write)
+        # Keep the snapshot that the transaction checked; a fresh read here
+        # would accept an external edit made between validation and replacement.
+        before = read() if verified is None else verified
+        updated = dict(value)
+        replace_snapshot(path, updated, before)
+        verified = updated
+    return Resource(resource_id, path, read, write)
 
 
 def desktop_quote(value: str) -> str:
@@ -156,13 +169,31 @@ def desktop_quote(value: str) -> str:
     return '"' + value.replace("%", "%%") + '"'
 
 
-def wrap_desktop_entry(text: str, launcher: str) -> str:
+def wrap_desktop_entry(text: str, launcher: str, *, identity: str = "", kind: str | None = None) -> str:
     prefix = desktop_quote(launcher) + " "
     eol = "\r\n" if "\r\n" in text else "\n"
+    lines = re.split(r"\r?\n", text)
+    main_lines = []
+    section = ""
+    for line in lines:
+        if re.fullmatch(r"\[[^\]]+\]", line):
+            section = line[1:-1]
+        elif section == "Desktop Entry":
+            main_lines.append(line)
+    application = _application_kind(identity, "\n".join(main_lines)) if kind is None else None
+    claude = os.path.basename(identity) == "com.anthropic.Claude.desktop" or kind == "claude" or (application is not None and application["kind"] == "claude")
+    generated_key = re.compile(r"^(\s*X-Claude-Generated\s*=\s*)true(\s*)$")
+    generated = claude and any(generated_key.fullmatch(line) for line in main_lines)
+    if generated:
+        # Claude Desktop checks the entire file with a literal substring guard.
+        # Disable its ownership keys in every section, including duplicates.
+        # Comments can retain their meaning without that exact substring; do
+        # not rewrite command arguments, URLs, or arbitrary metadata values.
+        lines = [generated_key.sub(r"\g<1>false\g<2>", line) if not line.lstrip().startswith("#") else line.replace("X-Claude-Generated=true", "X-Claude-Generated =true") for line in lines]
     section = ""
     main = main_exec = dbus = marker = False
     result = []
-    for line in re.split(r"\r?\n", text):
+    for line in lines:
         if re.fullmatch(r"\[[^\]]+\]", line):
             if section == "Desktop Entry":
                 if not dbus:
@@ -197,6 +228,8 @@ def wrap_desktop_entry(text: str, launcher: str) -> str:
     if not main or not main_exec:
         raise _conflict("桌面入口缺少 Desktop Entry / Exec")
     joined = eol.join(result)
+    if claude and "X-Claude-Generated=true" in joined:
+        raise _conflict("Claude 桌面入口在命令或元数据中包含生成标记，无法安全阻止客户端重生成")
     return joined.removesuffix(eol) + eol
 
 
@@ -261,12 +294,17 @@ class UserAdapters:
     def desired(self, region: str, timezone: str | None = None) -> dict:
         target = get_target_region(region, timezone)
         env = {"TZ": target["timezone"], "LANG": target["lang"], "LC_ALL": target["lcAll"]}
+        desktop_paths = {resource.id: resource.identity for resource in self.resources if resource.id in self.desired_files}
+        desktop_files = {
+            resource_id: dict(snapshot) if snapshot["text"] is None else {"text": wrap_desktop_entry(snapshot["text"], self.paths["launcher"], identity=os.path.basename(desktop_paths[resource_id])), "mode": 0o644}
+            for resource_id, snapshot in self.desired_files.items()
+        }
         return {
             "session-environment": {"text": "# FUCC managed environment\n" + "".join(f"{key}={env[key]}\n" for key in KEYS), "mode": 0o600},
             "app-launcher": {"text": self.launcher, "mode": 0o755},
             "claude-settings": {key: {"present": True, "value": env[key]} for key in KEYS},
             "vscode-settings": {key: [{"present": True, "value": env[key]}] for key in KEYS},
-            **self.desired_files,
+            **desktop_files,
         }
 
 
@@ -303,7 +341,9 @@ def create_user_adapters(environment: Mapping[str, str] | None = None, applicati
             bound_paths.add(identity)
             current = read_snapshot(identity)
             resources.append(snapshot_resource(resource_id, identity))
-            desired_files[resource_id] = dict(current) if current["text"] is None else {"text": wrap_desktop_entry(current["text"], paths["launcher"]), "mode": 0o644}
+            # Restoration uses the saved transaction snapshots, so constructing
+            # adapters must not require a new, safely wrappable on target.
+            desired_files[resource_id] = dict(current)
     seen = set()
     for directory in directories:
         for relative in _desktop_files(directory):
@@ -335,7 +375,7 @@ def create_user_adapters(environment: Mapping[str, str] | None = None, applicati
                 continue
             destination = os.path.join(user_applications, identity)
             try:
-                contents = wrap_desktop_entry(snapshot["text"], paths["launcher"])
+                contents = wrap_desktop_entry(snapshot["text"], paths["launcher"], identity=identity, kind=kind["kind"])
                 read_snapshot(destination)
                 resource_id = desktop_resource_id(identity)
                 enrolled = bound is None or any(entry["id"] == resource_id for entry in bound)

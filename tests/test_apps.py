@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from fucc.apps import create_user_adapters, desktop_quote, desktop_resource_id, wrap_desktop_entry
+from fucc.apps import create_user_adapters, desktop_quote, desktop_resource_id, snapshot_resource, wrap_desktop_entry
 from fucc.errors import FuccError
 from fucc.files import read_snapshot
 from fucc.jsonc import edit, parse
@@ -280,3 +280,178 @@ def test_desktop_escaping_crlf_and_resource_ids():
     for path in ('/line\nbreak', '/equals=value', '/null\x00'):
         with pytest.raises(FuccError):
             desktop_quote(path)
+
+
+@pytest.mark.parametrize("identity,kind", [("com.anthropic.Claude.desktop", None), ("custom.desktop", "claude"), ("", None)])
+def test_generated_claude_entry_keeps_commands_actions_and_metadata(identity, kind):
+    original = '''[Desktop Entry]
+Name=Claude Desktop
+Exec=claude-desktop --existing-argument "argument with spaces" %U
+TryExec=claude-desktop
+Icon=claude-desktop
+MimeType=x-scheme-handler/claude;
+Actions=NewChat;NewCode;ContinueLast;
+X-Claude-Generated=true
+Comment=Original localized metadata
+[Desktop Action NewChat]
+Name=New chat
+Exec=claude-desktop --new-chat %U
+[Desktop Action NewCode]
+Name=New code
+Exec=claude-desktop --new-code
+[Desktop Action ContinueLast]
+Name=Continue last
+Exec=claude-desktop --continue-last
+'''
+    actual = wrap_desktop_entry(original, "/fucc/launch", identity=identity, kind=kind)
+    expected = original.replace("\nExec=", '\nExec="/fucc/launch" ').replace("X-Claude-Generated=true", "X-Claude-Generated=false").replace("[Desktop Action NewChat]", "DBusActivatable=false\nX-FUCC-Managed=true\n[Desktop Action NewChat]")
+    assert actual == expected
+    assert "X-Claude-Generated=true" not in actual
+    assert wrap_desktop_entry(actual, "/fucc/launch", identity=identity, kind=kind) == actual
+
+
+def test_generated_claude_neutralizes_keys_across_sections_and_comment_tokens():
+    original = '''# X-Claude-Generated=true documents ownership
+[Desktop Entry]
+Name=Claude Desktop
+Exec=claude-desktop %U
+X-Claude-Generated=true
+X-Claude-Generated=true
+  X-Claude-Generated = true
+[Desktop Action NewChat]
+Name=New chat
+Exec=claude-desktop --new-chat
+X-Claude-Generated=true
+ # old X-Claude-Generated=true marker
+[Other metadata]
+X-Claude-Generated=true
+'''
+    actual = wrap_desktop_entry(original, "/fucc/launch")
+    assert "X-Claude-Generated=true" not in actual
+    assert actual.count("X-Claude-Generated=false") == 4
+    assert "  X-Claude-Generated = false" in actual
+    assert "# X-Claude-Generated =true documents ownership" in actual
+    assert " # old X-Claude-Generated =true marker" in actual
+    assert wrap_desktop_entry(actual, "/fucc/launch") == actual
+
+
+@pytest.mark.parametrize("extra", [
+    'Exec=claude-desktop --custom "X-Claude-Generated=true" %U\n',
+    'URL=https://example.invalid/?X-Claude-Generated=true\n',
+    'Comment=Metadata containing X-Claude-Generated=true\n',
+    '[Desktop Action Custom]\nName=Custom\nExec=claude-desktop --custom X-Claude-Generated=true\n',
+])
+def test_claude_generator_literal_in_commands_or_metadata_is_refused(extra):
+    original = '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop\nX-Claude-Generated=true\n' + extra
+    with pytest.raises(FuccError) as failure:
+        wrap_desktop_entry(original, "/fucc/launch")
+    assert failure.value.code == "CONFIG_CONFLICT"
+    assert extra not in str(failure.value)
+
+
+def test_non_claude_entry_and_custom_claude_ownership_are_unchanged():
+    original = '[Desktop Entry]\nName=Other application\nExec=other-app\nX-Claude-Generated=true\n[Desktop Action Custom]\nName=Claude\nExec=other-app --custom\n'
+    actual = wrap_desktop_entry(original, "/fucc/launch", identity="other.desktop")
+    assert "X-Claude-Generated=true" in actual
+    assert "X-Claude-Generated=false" not in actual
+    custom = '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop --custom %U\n'
+    assert "X-Claude-Generated=" not in wrap_desktop_entry(custom, "/fucc/launch")
+
+
+def test_claude_false_main_with_residual_guard_is_refused():
+    original = '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop\nX-Claude-Generated=false\n[Desktop Action Custom]\nName=Custom\nExec=claude-desktop --custom\nX-Claude-Generated=true\n'
+    with pytest.raises(FuccError) as failure:
+        wrap_desktop_entry(original, "/fucc/launch")
+    assert failure.value.code == "CONFIG_CONFLICT"
+
+
+def test_generated_claude_crlf_and_explicit_identity_are_idempotent():
+    original = '[Desktop Entry]\r\nName=Localized desktop name\r\nExec=/opt/custom-launcher %U\r\nX-Claude-Generated=true\r\n'
+    wrapped = wrap_desktop_entry(original, "/fucc/launch", identity="com.anthropic.Claude.desktop")
+    assert "X-Claude-Generated=false\r\n" in wrapped
+    assert "\n" not in wrapped.replace("\r\n", "")
+    assert wrap_desktop_entry(wrapped, "/fucc/launch", identity="com.anthropic.Claude.desktop") == wrapped
+
+
+def test_claude_generated_user_entry_restores_original_marker_and_permissions(context):
+    home, applications, _ = context
+    identity = "com.anthropic.Claude.desktop"
+    system_text = '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop\nX-Claude-Generated=true\n'
+    source = put(applications / identity, system_text)
+    original = '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop --custom %U\nX-Claude-Generated=true\nActions=NewChat;\n[Desktop Action NewChat]\nName=New chat\nExec=claude-desktop --new-chat %U\n'
+    path = put(home / ".local" / "share" / "applications" / identity, original)
+    path.chmod(0o600)
+    app = adapters(context)
+    target = resource(app, "desktop." + identity)
+    baseline = target.read()
+    assert baseline == {"text": original, "mode": 0o600}
+    desired = app.desired("us")[target.id]
+    target.write(desired)
+    assert "X-Claude-Generated=false" in path.read_text()
+    assert "X-Claude-Generated=true" not in path.read_text()
+    assert read_snapshot(path)["mode"] == 0o644
+    assert source.read_text() == system_text
+    bound = adapters(context, managed_desktop_files=[{"id": target.id, "identity": target.identity}])
+    assert bound.desired("us")[target.id] == desired
+    target.write(baseline)
+    assert read_snapshot(path) == baseline
+    assert source.read_text() == system_text
+
+
+def test_claude_unknown_literal_is_not_enrolled_or_overwritten(context):
+    home, applications, _ = context
+    identity = "com.anthropic.Claude.desktop"
+    original = '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop --custom X-Claude-Generated=true\nX-Claude-Generated=true\n'
+    source = put(applications / identity, original)
+    override = put(home / ".local" / "share" / "applications" / identity, original)
+    override.chmod(0o600)
+    app = adapters(context)
+    assert not any(item.id == "desktop." + identity for item in app.resources)
+    assert next(item for item in app.applications if item["kind"] == "claude")["supported"] is False
+    assert source.read_text() == original
+    assert read_snapshot(override) == {"text": original, "mode": 0o600}
+    bound = adapters(context, managed_desktop_files=[{"id": "desktop." + identity, "identity": str(override)}])
+    target = resource(bound, "desktop." + identity)
+    assert target.read() == {"text": original, "mode": 0o600}
+    with pytest.raises(FuccError) as failure:
+        bound.desired("us")
+    assert failure.value.code == "CONFIG_CONFLICT"
+    assert read_snapshot(override) == {"text": original, "mode": 0o600}
+    target.write({"text": None, "mode": None})
+    assert not override.exists()
+    assert source.read_text() == original
+
+
+@pytest.mark.parametrize("change", ["text", "mode", "appeared"])
+def test_snapshot_write_rejects_edits_after_transaction_read(tmp_path, change):
+    path = tmp_path / "managed.desktop"
+    if change != "appeared":
+        put(path, "original\n").chmod(0o600)
+    target = snapshot_resource("desktop.test.desktop", str(path))
+    baseline = target.read()
+    if change == "text":
+        path.write_text("external edit\n")
+    elif change == "mode":
+        path.chmod(0o644)
+    else:
+        put(path, "external file\n").chmod(0o600)
+    external = read_snapshot(path)
+    assert external != baseline
+    with pytest.raises(FuccError) as failure:
+        target.write({"text": "managed\n", "mode": 0o644})
+    assert failure.value.code == "CONFIG_CONFLICT"
+    assert read_snapshot(path) == external
+
+
+def test_snapshot_direct_write_and_restore_use_own_successful_snapshot(tmp_path):
+    path = tmp_path / "managed.desktop"
+    target = snapshot_resource("desktop.test.desktop", str(path))
+    first = {"text": "first managed\n", "mode": 0o644}
+    target.write(first)
+    first["text"] = "caller mutation must not change cached expected\n"
+    desired = {"text": "second managed\n", "mode": 0o600}
+    target.write(desired)
+    baseline = target.read()
+    baseline["text"] = "mutating read result must not change cached expected\n"
+    target.write({"text": None, "mode": None})
+    assert not path.exists()

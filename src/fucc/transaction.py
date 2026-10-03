@@ -348,6 +348,14 @@ class LocalTransaction:
             raise _unsafe()
         return actual
 
+    def _restorable(self, snapshot: dict[str, Any]) -> None:
+        if not self._bound(snapshot):
+            raise _unsafe()
+        for resource, expected in zip(self.resources, snapshot["resources"]):
+            actual = self._read(resource)
+            if not _equal(actual, expected["desired"]) and not _equal(actual, expected["original"]):
+                raise _unsafe()
+
     def _move(self, entry: dict[str, Any], value: Any) -> None:
         resource = next((item for item in self.resources if item.id == entry["id"] and item.identity == entry["identity"]), None)
         if resource is None:
@@ -470,13 +478,17 @@ class LocalTransaction:
                 previous = document["committed"] if document is not None else None
                 if previous is None or previous["region"] is None:
                     return {"kind": "noop"}
-                before = self._actual(previous)
+                self._restorable(previous)
             except Exception:
                 return {"kind": "recovery_required"}
             journal = {"kind": "restore", "previous": previous,
                        "target": {"region": None, "revision": previous["revision"] + 1, "resources": []},
-                       "entries": [{"id": resource["id"], "identity": resource["identity"], "before": before[index], "desired": resource["original"]}
-                                   for index, resource in enumerate(previous["resources"])]}
+                       # Keep the wire plan anchored to the committed target.
+                       # _move also accepts an already-restored original, and
+                       # skips that resource without writing it again.
+                       "entries": [{"id": resource["id"], "identity": resource["identity"],
+                                    "before": resource["desired"], "desired": resource["original"]}
+                                   for resource in previous["resources"]]}
             try:
                 self._publish(journal)
             except Exception:
