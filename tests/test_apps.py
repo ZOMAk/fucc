@@ -157,13 +157,120 @@ def test_custom_config_and_xdg_paths(context):
         create_user_adapters({**environment, "CLAUDE_CONFIG_DIR": "relative"}, [])
 
 
+def test_fresh_native_adapters_do_not_manage_session_or_non_claude_launchers(context):
+    home, applications, _ = context
+    originals = {
+        "google-chrome.desktop": '[Desktop Entry]\nName=Google Chrome\nExec=google-chrome %U\n',
+        "chromium.desktop": '[Desktop Entry]\nName=Chromium\nExec=chromium %U\n',
+        "chromium-browser.desktop": '[Desktop Entry]\nName=Chromium\nExec=/usr/bin/chromium-browser %U\n',
+        "microsoft-edge.desktop": '[Desktop Entry]\nName=Microsoft Edge\nExec=microsoft-edge %U\n',
+        "firefox.desktop": '[Desktop Entry]\nName=Firefox\nExec=firefox %u\n',
+        "com.microsoft.VSCode.desktop": '[Desktop Entry]\nName=Visual Studio Code\nExec=code %F\n',
+    }
+    for identity, original in originals.items():
+        put(applications / identity, original)
+    user_chrome = put(home / ".local" / "share" / "applications" / "google-chrome.desktop", originals["google-chrome.desktop"] + "Comment=keep\n")
+    user_chrome.chmod(0o600)
+    app = adapters(context)
+    assert {item.id for item in app.resources} == {"claude-settings", "vscode-settings"}
+    assert set(app.desired("us")) == {"claude-settings", "vscode-settings"}
+    assert app.retired_ids == set()
+    assert not (home / ".config" / "environment.d").exists()
+    assert not (home / ".config" / "fucc" / "launch").exists()
+    assert user_chrome.read_text().endswith("Comment=keep\n")
+    assert read_snapshot(user_chrome)["mode"] == 0o600
+    for identity in originals:
+        application = next(item for item in app.applications if item["id"] == identity)
+        assert application["supported"] is True
+        assert application["installation"] == "native"
+        assert application["adaptation"] == ("native-settings" if application["kind"] == "vscode" else "system-policy")
+        if application["kind"] != "vscode":
+            assert application["browserId"] == {"chromium.desktop": "chromium", "chromium-browser.desktop": "chromium-browser"}.get(identity, application["kind"])
+        assert (applications / identity).read_text() == originals[identity]
+
+
+def test_saved_resources_retire_to_originals_without_generating_new_wrappers(context):
+    home, applications, _ = context
+    app = adapters(context)
+    legacy = {
+        "session-environment": app.paths["sessionFile"],
+        "app-launcher": app.paths["launcher"],
+        "desktop.google-chrome.desktop": str(home / ".local" / "share" / "applications" / "google-chrome.desktop"),
+        "desktop.com.microsoft.VSCode.desktop": str(home / ".local" / "share" / "applications" / "com.microsoft.VSCode.desktop"),
+    }
+    for identity in legacy.values():
+        put(identity, "[Desktop Entry]\nExec=\nold managed content\n").chmod(0o600)
+    bindings = [{"id": identity, "identity": path} for identity, path in legacy.items()]
+    bindings += [{"id": item.id, "identity": item.identity} for item in app.resources]
+    bindings += [{"id": "bash-profile", "identity": str(home / ".config" / "fucc" / "persist")},
+                 {"id": "machine-profile", "identity": "machine:example"}]
+    # New apps can use native configuration without extending desktop bindings.
+    put(applications / "firefox.desktop", '[Desktop Entry]\nName=Firefox\nExec=firefox %u\n')
+    bound = adapters(context, managed_resources=bindings)
+    assert bound.retired_ids == set(legacy)
+    assert {item.id for item in bound.resources} == set(legacy) | {"claude-settings", "vscode-settings"}
+    assert not bound.desired_files
+    with pytest.raises(FuccError) as failure:
+        bound.desired("jp")
+    assert failure.value.code == "CONFIG_CONFLICT"
+    originals = {identity: {"text": None, "mode": None} for identity in legacy}
+    originals["session-environment"] = {"text": "# user's original\nKEEP=value\n", "mode": 0o640}
+    desired = bound.desired("jp", retired_originals=originals)
+    assert set(desired) == {item.id for item in bound.resources}
+    for identity in legacy:
+        assert desired[identity] == originals[identity]
+        assert desired[identity] is not originals[identity]
+        target = resource(bound, identity)
+        target.read()
+        target.write(desired[identity])
+        assert read_snapshot(target.identity) == originals[identity]
+    desired["session-environment"]["text"] = "mutated returned target\n"
+    assert originals["session-environment"]["text"] == "# user's original\nKEEP=value\n"
+
+
+def test_saved_launcher_remains_active_only_for_saved_claude_desktop(context):
+    home, applications, _ = context
+    put(applications / "com.anthropic.Claude.desktop", '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop %U\nX-Claude-Generated=true\n')
+    initial = adapters(context)
+    bindings = [{"id": item.id, "identity": item.identity} for item in initial.resources]
+    session_path = str(home / ".config" / "environment.d" / "60-fucc.conf")
+    bindings.append({"id": "session-environment", "identity": session_path})
+    desired = initial.desired("us")
+    for target in initial.resources:
+        target.write(desired[target.id])
+    bound = adapters(context, managed_resources=bindings)
+    assert bound.retired_ids == {"session-environment"}
+    value = bound.desired("eu", retired_originals={"session-environment": {"text": None, "mode": None}})
+    assert value["app-launcher"] == desired["app-launcher"]
+    assert value["desktop.com.anthropic.Claude.desktop"] == desired["desktop.com.anthropic.Claude.desktop"]
+    assert value["session-environment"] == {"text": None, "mode": None}
+
+
+def test_full_and_legacy_desktop_binding_arguments_are_compatible(context):
+    home, _, _ = context
+    binding = {"id": "desktop.google-chrome.desktop", "identity": str(home / ".local" / "share" / "applications" / "google-chrome.desktop")}
+    bound = adapters(context, managed_desktop_files=[binding], managed_resources=[binding])
+    assert [item.id for item in bound.resources].count(binding["id"]) == 1
+    assert bound.retired_ids == {binding["id"]}
+    assert bound.desired("us", retired_originals={binding["id"]: {"text": None, "mode": None}})[binding["id"]] == {"text": None, "mode": None}
+
+
+def test_rejects_saved_fixed_resource_path_substitution(context):
+    home, _, _ = context
+    for resource_id in ("session-environment", "app-launcher", "claude-settings", "vscode-settings"):
+        with pytest.raises(FuccError) as failure:
+            adapters(context, managed_resources=[{"id": resource_id, "identity": str(home / "foreign-config")}])
+        assert failure.value.code == "CONFIG_CONFLICT"
+
+
 def test_wraps_actions_and_url_handlers_and_restores_absent_overrides(context):
     _, applications, _ = context
-    original = '[Desktop Entry]\nName=Google Chrome\nExec=/opt/google/chrome/google-chrome %U\nIcon=google-chrome\nMimeType=x-scheme-handler/https;\nDBusActivatable=true\nActions=new-window;\n[Desktop Action new-window]\nName=New Window\nExec=/opt/google/chrome/google-chrome --new-window %U\n'
-    source = put(applications / "google-chrome.desktop", original)
+    original = '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop %U\nIcon=claude-desktop\nMimeType=x-scheme-handler/claude;\nDBusActivatable=true\nActions=new-window;\n[Desktop Action new-window]\nName=New Window\nExec=claude-desktop --new-window %U\n'
+    source = put(applications / "com.anthropic.Claude.desktop", original)
     put(applications / "com.microsoft.VSCodeURLHandler.desktop", '[Desktop Entry]\nName=Visual Studio Code URL Handler\nNoDisplay=true\nExec=/usr/share/code/code --open-url %U\n')
     app = adapters(context)
     assert len([item for item in app.applications if item["supported"]]) == 2
+    assert [target.id for target in app.resources if target.id.startswith("desktop.")] == ["desktop.com.anthropic.Claude.desktop"]
     for target in [item for item in app.resources if item.id.startswith("desktop.")]:
         baseline = target.read()
         target.write(app.desired("us")[target.id])
@@ -179,11 +286,11 @@ def test_wraps_actions_and_url_handlers_and_restores_absent_overrides(context):
 
 def test_existing_user_desktop_override_takes_precedence(context):
     home, applications, _ = context
-    put(applications / "google-chrome.desktop", '[Desktop Entry]\nName=Chrome\nExec=/opt/google/chrome/google-chrome %U\n')
-    original = '[Desktop Entry]\nName=My Chrome\nExec=/opt/google/chrome/google-chrome --custom %U\nIcon=my-chrome\n'
-    path = put(home / ".local" / "share" / "applications" / "google-chrome.desktop", original)
+    put(applications / "com.anthropic.Claude.desktop", '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop %U\n')
+    original = '[Desktop Entry]\nName=My Claude\nExec=claude-desktop --custom %U\nIcon=my-claude\n'
+    path = put(home / ".local" / "share" / "applications" / "com.anthropic.Claude.desktop", original)
     app = adapters(context)
-    target = resource(app, "desktop.google-chrome.desktop")
+    target = resource(app, "desktop.com.anthropic.Claude.desktop")
     baseline = target.read()
     target.write(app.desired("us")[target.id])
     assert '--custom %U' in path.read_text()
@@ -193,16 +300,16 @@ def test_existing_user_desktop_override_takes_precedence(context):
 
 def test_saved_bindings_survive_uninstall_and_defer_new_apps(context):
     _, applications, _ = context
-    source = put(applications / "google-chrome.desktop", '[Desktop Entry]\nName=Google Chrome\nExec=/opt/google/chrome/google-chrome %U\n')
+    source = put(applications / "com.anthropic.Claude.desktop", '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop %U\n')
     initial = adapters(context)
-    desktop = resource(initial, "desktop.google-chrome.desktop")
+    desktop = resource(initial, "desktop.com.anthropic.Claude.desktop")
     baseline = desktop.read()
     desktop.write(initial.desired("us")[desktop.id])
     source.unlink()
     put(applications / "com.microsoft.VSCode.desktop", '[Desktop Entry]\nName=Visual Studio Code\nExec=/usr/share/code/code %F\n')
     bound = adapters(context, managed_desktop_files=[{"id": desktop.id, "identity": desktop.identity}])
     assert [item.id for item in bound.resources if item.id.startswith("desktop.")] == [desktop.id]
-    assert next(item for item in bound.applications if item["kind"] == "vscode")["supported"] is False
+    assert next(item for item in bound.applications if item["kind"] == "vscode")["adaptation"] == "native-settings"
     assert bound.desired("jp")[desktop.id] == initial.desired("us")[desktop.id]
     resource(bound, desktop.id).write(baseline)
     assert read_snapshot(desktop.identity)["text"] is None
@@ -226,23 +333,27 @@ def test_sandbox_hidden_and_symlink_entries_report_unsupported(context):
     put(applications / "claude.desktop", '[Desktop Entry]\nName=Claude\nHidden=true\nExec=/usr/bin/claude\n')
     (applications / "google-chrome.desktop").symlink_to(applications / "claude.desktop")
     app = adapters(context)
-    assert len([item for item in app.applications if 'Snap / Flatpak' in item.get("reason", "")]) == 2
-    assert not any(item["supported"] for item in app.applications)
+    chromium = next(item for item in app.applications if item["id"] == "chromium.desktop")
+    assert chromium["supported"] is True and chromium["adaptation"] == "system-policy"
+    assert chromium["installation"] == "snap"
+    assert next(item for item in app.applications if item["id"] == "com.microsoft.VSCode.desktop")["installation"] == "flatpak"
+    assert "实际覆盖以机器策略状态为准" in chromium["reason"]
+    assert not any(item["supported"] for item in app.applications if item["id"] != "chromium.desktop")
     assert not any(item.id.startswith("desktop.") for item in app.resources)
 
 
-def test_firefox_native_is_enrolled_without_replacing_other_saved_bindings(context):
+def test_firefox_native_uses_policy_without_enrolling_desktop_bindings(context):
     _, applications, _ = context
     put(applications / "firefox.desktop", '[Desktop Entry]\nName=Firefox\nExec=/usr/lib/firefox/firefox %u\nDBusActivatable=true\n')
     put(applications / "com.microsoft.VSCode.desktop", '[Desktop Entry]\nName=Visual Studio Code\nExec=/usr/share/code/code %F\n')
     frozen = adapters(context, managed_desktop_files=[])
     assert not any(item.id.startswith("desktop.") for item in frozen.resources)
     candidate = adapters(context, managed_desktop_files=[], enroll_firefox=True)
-    assert [item.id for item in candidate.resources if item.id.startswith("desktop.")] == ["desktop.firefox.desktop"]
-    value = candidate.desired("us")["desktop.firefox.desktop"]["text"]
-    assert 'DBusActivatable=false' in value and '%u' in value
+    assert not any(item.id.startswith("desktop.") for item in candidate.resources)
+    assert "app-launcher" not in candidate.desired("us")
     assert next(app for app in candidate.applications if app["kind"] == "firefox")["supported"] is True
-    assert next(app for app in candidate.applications if app["kind"] == "vscode")["supported"] is False
+    assert next(app for app in candidate.applications if app["kind"] == "firefox")["adaptation"] == "system-policy"
+    assert next(app for app in candidate.applications if app["kind"] == "vscode")["adaptation"] == "native-settings"
 
 
 def test_firefox_snap_and_flatpak_do_not_receive_native_launcher(context):
@@ -252,13 +363,18 @@ def test_firefox_snap_and_flatpak_do_not_receive_native_launcher(context):
     app = adapters(context, managed_desktop_files=[], enroll_firefox=True)
     assert not any(item.id.startswith("desktop.") for item in app.resources)
     firefox = [item for item in app.applications if item["kind"] == "firefox"]
-    assert len(firefox) == 2 and not any(item["supported"] for item in firefox)
+    assert len(firefox) == 2
+    assert next(item for item in firefox if item["id"] == "firefox_firefox.desktop")["supported"] is True
+    assert next(item for item in firefox if item["id"] == "org.mozilla.firefox.desktop")["supported"] is False
+    assert next(item for item in firefox if item["id"] == "firefox_firefox.desktop")["installation"] == "snap"
+    assert next(item for item in firefox if item["id"] == "org.mozilla.firefox.desktop")["installation"] == "flatpak"
     assert any("机器策略" in item["reason"] for item in firefox)
     assert any("Flatpak" in item["reason"] for item in firefox)
 
 
 def test_launcher_runs_with_empty_path_and_quoted_home(context):
-    home, _, _ = context
+    home, applications, _ = context
+    put(applications / "com.anthropic.Claude.desktop", '[Desktop Entry]\nName=Claude Desktop\nExec=claude-desktop %U\n')
     app = adapters(context)
     put(home / ".config" / "fucc" / "env.sh", "export TZ='Asia/Tokyo'\nexport LANG='ja_JP.UTF-8'\nexport LC_ALL='ja_JP.UTF-8'\n")
     target = resource(app, "app-launcher")

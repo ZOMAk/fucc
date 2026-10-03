@@ -66,7 +66,9 @@ def test_unified_enable_switch_noop_and_restore_original(local):
     status = runtime.status()
     assert status["health"] == "healthy" and status["configured"] == target_environment("us")
     assert status["machine"]["active"] and status["coverage"]["applicationRuntimeVerified"] is False
-    assert status["applications"][0]["managed"] is True
+    assert status["applications"][0]["adaptation"] == "system-policy"
+    assert status["applications"][0]["managed"] is False  # The fixture has no machine browser policies.
+    assert status["configurationModel"] == "native-first" and not status["nativeMigrationRequired"]
     assert "keep-secret" not in json.dumps(status)
     assert runtime.on("us")["kind"] == "noop"
     assert runtime.on("eu")["kind"] == "committed"
@@ -97,6 +99,35 @@ def test_user_only_and_standalone_profile_guard(local):
     assert_local_inactive(env)
 
 
+def test_application_status_uses_exact_browser_and_native_vscode_resources(local):
+    _, env, machine, apps, locales = local
+    (apps / "chromium.desktop").write_text('[Desktop Entry]\nName=Chromium\nExec=/usr/bin/chromium %U\n')
+    (apps / "chromium-browser.desktop").write_text('[Desktop Entry]\nName=Chromium Browser\nExec=/usr/bin/chromium-browser %U\n')
+    (apps / "flatpak-chromium.desktop").write_text('[Desktop Entry]\nName=Chromium\nExec=/usr/bin/flatpak run org.chromium.Chromium %U\n')
+    (apps / "hidden-chromium.desktop").write_text('[Desktop Entry]\nName=Chromium\nHidden=true\nExec=/usr/bin/chromium %U\n')
+    (apps / "code.desktop").write_text('[Desktop Entry]\nName=Visual Studio Code\nExec=/usr/bin/code %F\n')
+    inspect = machine.inspect
+    machine.inspect = lambda: {**inspect(), "browsers": [
+        {"id": "chrome", "managed": False, "configurationAligned": None},
+        {"id": "chromium", "managed": True, "configurationAligned": True},
+        {"id": "chromium-browser", "managed": True, "configurationAligned": False},
+    ]}
+    runtime = LocalRuntime(env, [str(apps)], machine, locales)
+    assert runtime.on("us")["kind"] == "committed"
+    status = runtime.status()
+    observed = {app["id"]: app for app in status["applications"]}
+    assert not observed["google-chrome.desktop"]["managed"]
+    assert observed["chromium.desktop"]["managed"] and observed["chromium.desktop"]["configurationAligned"]
+    assert observed["chromium-browser.desktop"]["managed"] and not observed["chromium-browser.desktop"]["configurationAligned"]
+    assert not observed["flatpak-chromium.desktop"]["managed"]
+    assert observed["flatpak-chromium.desktop"]["configurationAligned"] is None
+    assert not observed["hidden-chromium.desktop"]["managed"]
+    assert observed["code.desktop"]["managed"] and observed["code.desktop"]["configurationAligned"]
+    assert all(not resource["id"].startswith("desktop.") for resource in status["resources"])
+    assert not Path(runtime.user.paths["sessionFile"]).exists()
+    assert runtime.off()["kind"] == "restored"
+
+
 def test_external_edits_block_restore_without_overwrite(local):
     runtime, _, machine, _, _ = local
     runtime.on("us", user_only=True)
@@ -124,8 +155,10 @@ def test_full_failure_compensates_user_resources(local):
 
 def test_saved_desktop_binding_survives_uninstall(local):
     runtime, env, machine, apps, locales = local
+    (apps / "claude.desktop").write_text('[Desktop Entry]\nName=Claude Desktop\nExec=/opt/claude/claude %U\n')
+    runtime = LocalRuntime(env, [str(apps)], machine, locales)
     runtime.on("us", user_only=True)
-    (apps / "google-chrome.desktop").unlink()
+    (apps / "claude.desktop").unlink()
     resumed = LocalRuntime(env, [str(apps)], machine, locales)
     assert resumed.status()["health"] == "healthy"
     assert resumed.off()["kind"] == "restored"
@@ -151,7 +184,7 @@ def test_root_session_rejected_before_state_creation(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_upgrade_enrolls_native_firefox_and_preserves_existing_originals(local):
+def test_native_firefox_discovery_does_not_add_user_desktop_overrides(local):
     runtime, env, machine, apps, locales = local
     runtime.on("us", user_only=True, timezone="America/Los_Angeles")
     old = json.loads((runtime.root / "local-transaction.json").read_text())["payload"]
@@ -160,20 +193,21 @@ def test_upgrade_enrolls_native_firefox_and_preserves_existing_originals(local):
     (apps / "firefox.desktop").write_text('[Desktop Entry]\nName=Firefox\nExec=/usr/lib/firefox/firefox %u\n')
     resumed = LocalRuntime(env, [str(apps)], machine, locales)
     assert resumed.status()["health"] == "healthy"
-    assert resumed.on("us", user_only=True, timezone="America/Los_Angeles")["kind"] == "committed"
+    assert resumed.on("us", user_only=True, timezone="America/Los_Angeles")["kind"] == "noop"
     ledger = json.loads((resumed.root / "local-transaction.json").read_text())["payload"]
-    assert ledger["version"] == 3
+    assert ledger["version"] == 2
     assert {entry["id"]: entry["original"] for entry in ledger["committed"]["resources"] if entry["id"] in original} == original
     firefox = next(app for app in resumed.status()["applications"] if app["kind"] == "firefox")
-    assert firefox["managed"] and firefox["configurationAligned"]
+    assert firefox["supported"] and firefox["adaptation"] == "system-policy"
+    assert not firefox["managed"] and firefox["configurationAligned"] is None
     assert resumed.on("us", user_only=True, timezone="America/Los_Angeles")["kind"] == "noop"
     override = Path(env["HOME"]) / ".local/share/applications/firefox.desktop"
-    assert override.exists() and not machine.writes
+    assert not override.exists() and not machine.writes
     assert resumed.off()["kind"] == "restored" and not override.exists()
     assert (Path(env["HOME"]) / ".bashrc").read_text() == "# daily settings\nexport OTHER=value\n"
 
 
-def test_failed_firefox_enrollment_restores_previous_binding_set(local):
+def test_machine_failure_with_discovered_firefox_preserves_native_binding_set(local):
     runtime, env, machine, apps, locales = local
     runtime.on("us", user_only=True)
     previous = runtime.status()["resources"]
@@ -187,33 +221,33 @@ def test_failed_firefox_enrollment_restores_previous_binding_set(local):
     assert resumed.off()["kind"] == "restored"
 
 
-def test_recover_interrupted_firefox_enrollment_reloads_previous_bindings(local, monkeypatch):
+def test_recover_interrupted_native_settings_switch_restores_previous_bindings(local, monkeypatch):
     from fucc import apps as app_module
 
     runtime, env, machine, apps, locales = local
     runtime.on("us", user_only=True)
     previous = runtime.status()["resources"]
     (apps / "firefox.desktop").write_text('[Desktop Entry]\nName=Firefox\nExec=/usr/lib/firefox/firefox %u\n')
-    create_snapshot = app_module.snapshot_resource
+    create_resource = app_module.vscode_resource
     interrupted = [False]
 
-    def snapshot(resource_id, path):
-        value = create_snapshot(resource_id, path)
+    def vscode_resource(path):
+        value = create_resource(path)
         original_write = value.write
 
         def write(desired):
             original_write(desired)
-            if resource_id == "desktop.firefox.desktop" and not interrupted[0]:
+            if not interrupted[0]:
                 interrupted[0] = True
-                raise KeyboardInterrupt("fixture power loss after Firefox desktop override")
+                raise KeyboardInterrupt("fixture power loss after native VS Code settings")
 
         value.write = write
         return value
 
-    monkeypatch.setattr(app_module, "snapshot_resource", snapshot)
+    monkeypatch.setattr(app_module, "vscode_resource", vscode_resource)
     resumed = LocalRuntime(env, [str(apps)], machine, locales)
     with pytest.raises(KeyboardInterrupt):
-        resumed.on("us", user_only=True)
+        resumed.on("eu", user_only=True)
     recovering = LocalRuntime(env, [str(apps)], machine, locales)
     assert recovering.recover()["kind"] == "recovered"
     assert recovering.status()["health"] == "healthy" and recovering.status()["resources"] == previous

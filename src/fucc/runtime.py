@@ -44,7 +44,7 @@ class LocalRuntime:
             bindings = []  # The coordinator itself retains and rejects the invalid state.
         self.bash = BashRuntime(self.environment, list_locales=list_locales)
         self.user = create_user_adapters(self.environment, application_dirs,
-                                        [entry for entry in bindings if entry["id"].startswith("desktop.")] if bindings else None)
+                                        managed_resources=bindings if bindings else None)
         self.machine = machine if machine is not None else MachineAdapter(
             str(Path(__file__).with_name("helper.py")), sys.executable, self.environment)
         self.transaction = self._transaction(self.user)
@@ -58,7 +58,7 @@ class LocalRuntime:
     def _reload_bindings(self):
         bindings = read_resource_bindings(self.root)
         self.user = create_user_adapters(self.environment, self.application_dirs,
-                                        [entry for entry in bindings if entry["id"].startswith("desktop.")] if bindings else None)
+                                        managed_resources=bindings if bindings else None)
         self.transaction = self._transaction(self.user)
 
     def _read_bash(self):
@@ -118,13 +118,23 @@ class LocalRuntime:
         assert_locale(target, self.list_locales)
         bindings = read_resource_bindings(self.root)
         candidate = create_user_adapters(self.environment, self.application_dirs,
-                                        [entry for entry in bindings if entry["id"].startswith("desktop.")] if bindings else None,
+                                        managed_resources=bindings if bindings else None,
                                         enroll_firefox=True)
+        # Read immutable baselines through the previously bound coordinator,
+        # before enrolling any new launcher. Retired resources stay in the
+        # ledger so migration, compensation and off share the original backup.
+        retired_originals = {}
+        for resource_id in candidate.retired_ids:
+            original = self.transaction.committed_original(resource_id)
+            if original is None:
+                raise FuccError("旧配置缺少有效原始快照；请保留状态并运行 fucc recover。", "RECOVERY_REQUIRED", 21)
+            retired_originals[resource_id] = original
         enrollment = {entry.id for entry in candidate.resources} != {entry.id for entry in self.user.resources}
         if enrollment:
             self.user = candidate
             self.transaction = self._transaction(self.user)
-        desired = {**self.user.desired(target, profile["timezone"]),
+        self.user = candidate
+        desired = {**self.user.desired(target, profile["timezone"], retired_originals=retired_originals),
                    "bash-profile": {"region": target, **({"timezone": profile["timezone"]} if dynamic else {})},
                    self.machine.resource.id: self.machine.resource.read() if user_only else
                    self.machine.desired(target, profile["timezone"]) if dynamic else self.machine.desired(target)}
@@ -132,8 +142,9 @@ class LocalRuntime:
             app["kind"] == "firefox" and app["supported"] for app in self.user.applications)
         result = self.transaction.apply(target, desired, wire_version=3 if firefox else 2 if dynamic else 1,
                                         enroll=enrollment)
-        if enrollment:
-            # A compensated enrollment publishes the previous, smaller resource set.
+        if result["kind"] in ("compensated", "committed", "noop"):
+            # Reconstruct from the committed bindings after migration or
+            # compensation; never keep adapters for an uncommitted enrollment.
             self._reload_bindings()
         return result
 
@@ -162,8 +173,21 @@ class LocalRuntime:
         for app in visible:
             resource = next((entry for entry in saved["resources"] if entry["id"].startswith("desktop.")
                              and Path(entry["identity"]).name == app["id"]), None)
-            managed = saved["active"] and resource is not None
-            applications.append({**app, "managed": managed, "configurationAligned": resource["aligned"] if managed else None})
+            adaptation = app.get("adaptation")
+            if adaptation == "native-settings":
+                resource = next((entry for entry in saved["resources"] if entry["id"] == "vscode-settings"), None)
+                managed = saved["active"] and app["supported"] and resource is not None
+                aligned = resource["aligned"] if managed else None
+            elif adaptation == "system-policy":
+                browser = next((entry for entry in machine["browsers"]
+                                if entry["id"] == app.get("browserId", app["kind"])), None)
+                managed = bool(app["supported"] and browser and browser["managed"]
+                               and browser.get("installation", "native") == app.get("installation", "native"))
+                aligned = browser["configurationAligned"] if managed else None
+            else:
+                managed = saved["active"] and resource is not None and resource["id"] not in self.user.retired_ids
+                aligned = resource["aligned"] if managed else None
+            applications.append({**app, "managed": managed, "configurationAligned": aligned})
         nested_recovery = machine["recoveryRequired"] or bash["health"] == "recovery_required" or bash["transaction"]["kind"] != "none"
         health = "recovery_required" if nested_recovery else "degraded" if saved["health"] == "healthy" and "degraded" in (machine["health"], bash["health"]) else saved["health"]
         configured = None
@@ -173,15 +197,30 @@ class LocalRuntime:
                 configured = target_environment(saved["region"], committed.get("timezone") if committed else None)
             except FuccError:
                 health = "recovery_required"
+        retirement_pending = []
+        if saved["active"]:
+            try:
+                retirement_pending = sorted(resource_id for resource_id in self.user.retired_ids
+                                            if self.transaction.committed_desired(resource_id)
+                                            != self.transaction.committed_original(resource_id))
+            except FuccError:
+                health = "recovery_required"
+                retirement_pending = sorted(self.user.retired_ids)
         return {**saved, "health": health, "scope": "local-claude-environment",
+                "configurationModel": "legacy" if retirement_pending else "native-first",
+                "nativeMigrationRequired": bool(retirement_pending),
+                "retirementPendingResources": retirement_pending,
+                "retiredResources": sorted(self.user.retired_ids - set(retirement_pending)) if saved["active"] else [],
                 "configured": configured,
                 "bash": bash["platform"], "machine": machine, "applications": applications,
                 "coverage": {"claudeSettings": "当前用户 settings.json 的 env 三键；项目、settings.local 和管理配置可能覆盖。",
                              "vscodeSettings": "VS Code 默认用户配置；独立 profiles、Insiders、自定义 user-data-dir 和远程扩展环境未逐一管理。",
+                             "desktopSessionEnvironmentManaged": "session-environment" in retirement_pending,
                              "machineConfigurationVerified": machine["health"] == "healthy", "applicationRuntimeVerified": False},
                 "paths": self.user.paths,
                 "activation": {
-                    "applications": "完全退出 Chrome、Firefox、VS Code 和 Claude Desktop 后，从桌面入口重新启动；VS Code 新窗口可能复用旧进程。" if saved["active"] else "未开启统一配置。关闭后已运行的应用需完全退出后重开。",
+                    "applications": "完全退出相关应用后重开；VS Code 的 Claude 使用扩展原生配置，Claude Desktop 使用受管桌面入口。" if saved["active"] else "未开启统一配置。关闭后已运行的应用需完全退出后重开。",
                     "terminal": "新开交互式 Bash，或加载 bash.activation 给出的 env.sh。" if saved["active"] else "关闭后从桌面重新打开终端，已有父终端可能仍保留旧环境。",
-                    "session": "environment.d 配置在下一次完整桌面会话启动时读取；已有会话和进程不会自动更换环境。",
+                    "session": "旧版会话环境仍在管理中；再次运行 fucc on 会还原旧覆盖，保留原始快照。" if "session-environment" in retirement_pending else
+                               "FUCC 不再写入桌面会话环境；浏览器和桌面采用系统时区。已有进程若继承固定 TZ，仍可能覆盖系统时区，运行时效果需在应用内核实。",
                     "verifiedRunningApplications": False}}

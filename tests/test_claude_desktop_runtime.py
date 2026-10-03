@@ -83,7 +83,7 @@ def assert_all_targets(runtime, zone):
     assert json.loads(Path(runtime.user.paths["claudeSettings"]).read_text())["env"] == {**expected, "KEEP": "value"}
     rows = parse(Path(runtime.user.paths["vscodeSettings"]).read_text())["claudeCode.environmentVariables"]
     assert {entry["name"]: entry["value"] for entry in rows} == {**expected, "KEEP": "value"}
-    assert f"TZ={zone}" in Path(runtime.user.paths["sessionFile"]).read_text()
+    assert not Path(runtime.user.paths["sessionFile"]).exists()
 
 
 def assert_fully_restored(context, runtime):

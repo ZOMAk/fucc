@@ -70,7 +70,9 @@ def assert_all_targets(runtime, zone):
     assert json.loads(Path(runtime.user.paths["claudeSettings"]).read_text())["env"] == expected
     rows = parse(Path(runtime.user.paths["vscodeSettings"]).read_text())["claudeCode.environmentVariables"]
     assert {entry["name"]: entry["value"] for entry in rows} == expected
-    assert f"TZ={zone}" in Path(runtime.user.paths["sessionFile"]).read_text()
+    assert not Path(runtime.user.paths["sessionFile"]).exists()
+    assert status["configurationModel"] == "native-first"
+    assert not status["coverage"]["desktopSessionEnvironmentManaged"]
 
 
 def originals(runtime):

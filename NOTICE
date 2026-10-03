@@ -1,4 +1,4 @@
-FUCC (Fix You, Claude Code) 0.0.4
+FUCC (Fix You, Claude Code) 0.0.5
 
 This Python implementation derives Ubuntu environment management, diagnostics,
 and transactional storage from FUCC 0.0.1, a local independent extraction of
@@ -16,3 +16,7 @@ preserving existing restoration baselines while extending active configurations.
 
 The 0.0.3 maintenance fix preserves generated Claude Desktop launchers as custom
 entries while managed, and recognizes exactly restored originals during off.
+
+FUCC 0.0.5 prioritizes native Claude and VS Code settings and machine browser
+policies, retiring desktop-session environment overrides and browser/editor
+launch wrappers while preserving immutable restoration baselines.

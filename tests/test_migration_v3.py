@@ -157,7 +157,17 @@ def test_actual_002_local_runtime_upgrades_firefox_and_restores_initial_baseline
                            "media.peerconnection.ice.proxy_only_if_behind_proxy"))
     assert firefox.stat().st_mode & 0o777 == 0o644
     snap = next(app for app in upgraded["status"]["applications"] if app["kind"] == "firefox")
-    assert not snap["managed"] and not snap["supported"]
+    assert snap["managed"] and snap["supported"] and snap["configurationAligned"]
+    assert snap["adaptation"] == "system-policy"
+    outer = payload(outer_path)
+    retired = set(upgraded["status"]["retiredResources"])
+    assert {"session-environment", "app-launcher", "desktop.google-chrome.desktop"} <= retired
+    assert all(entry["desired"] == entry["original"] for entry in outer["committed"]["resources"] if entry["id"] in retired)
+    assert not any(entry["id"].startswith("desktop.") and "firefox" in entry["id"] for entry in outer["committed"]["resources"])
+    assert not (home / ".config/environment.d/60-fucc.conf").exists()
+    assert not (home / ".config/fucc/launch").exists()
+    assert not (home / ".local/share/applications/google-chrome.desktop").exists()
+    assert not (home / ".local/share/applications/firefox_firefox.desktop").exists()
 
     restored = invoke(project / "src", "new-off")
     assert restored["result"] == "restored" and restored["status"]["health"] == "healthy"

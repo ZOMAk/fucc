@@ -1,11 +1,11 @@
-# FUCC 0.0.4 实现说明
+# FUCC 0.0.5 实现说明
 
 | 模块 | 职责 |
 |---|---|
 | cli / output | argparse、稳定 JSON/退出码、ASCII 与 CJK 宽度 |
 | runtime | 统一用户事务，嵌套 Bash/机器恢复 |
 | bash | 兼容 v1、动态时区 v2 状态、不可变 daily 快照、保护/恢复日志及加载块 |
-| apps / jsonc | 会话、launcher、设置及桌面覆盖；JSONC token 精确编辑 |
+| apps / jsonc | 原生 Claude/VS Code 设置、按需 Claude Desktop launcher；旧覆盖迁移；JSONC token 精确编辑 |
 | files | 安全快照、期望值比较、原子替换与 fsync |
 | machine / helper | 固定机器目录/命令、UID 授权、策略冲突与提权 |
 | firefox | 原生 / Snap 能力发现、严格政策解析与 Firefox Preferences 合并 |
@@ -14,7 +14,7 @@
 | detection / network | 只读检测、ZoneInfo、IP 多源与凭据隐藏 |
 | regions / paths / errors | 地区数据、美国 IANA 时区选择、HOME/XDG 和稳定错误 |
 
-产品名、命令与状态路径仍为 `fucc`，源码目录为 `fucc2`，Conda 环境为 `fucc`，版本为 `0.0.4`。兼容 0.0.1 的 v1 状态及 0.0.2 的动态时区 v2 状态；增加 Firefox 使用 v3 状态保护。checked envelope 的 SHA-256 输入遵循原 ECMAScript 数字格式和 UTF-16 属性排序，以 JCS 实现；拒绝不安全数字、非有限数、孤立 surrogate 和非 JSON 值。
+产品名、命令与状态路径仍为 `fucc`，源码目录为 `fucc2`，Conda 环境为 `fucc`，版本为 `0.0.5`。兼容 0.0.1 的 v1 状态及 0.0.2 的动态时区 v2 状态；增加 Firefox 使用 v3 状态保护。checked envelope 的 SHA-256 输入遵循原 ECMAScript 数字格式和 UTF-16 属性排序，以 JCS 实现；拒绝不安全数字、非有限数、孤立 surrogate 和非 JSON 值。
 
 统一 coordinator 为资源绑定 id/identity，首次开启记录 original，切换仅改 desired。Bash baseline 为 daily，统一本机 off 会关闭以前单独开启的 Bash。桌面从保存绑定恢复集合，卸载不会丢原始快照。
 
@@ -32,7 +32,7 @@
 
 选择顺序为显式 `--timezone`、可信美国 IP 时区、已保存的美国目标、纽约默认值。多来源须一致且全部确认美国，已有时区值须为同一有效美国时区；单来源成功也可选择。查询失败、时区缺失或无效、来源不一致、非美国出口均保留已保存的美国目标，否则回退 `America/New_York`。回退原因公开输出。
 
-地区仍为 `us`，`LANG`、`LC_ALL` 保持 `en_US.UTF-8`，浏览器语言策略不随美国城市改变。所选时区进入 Bash、原生设置、会话环境、桌面启动器以及完整模式下的机器配置；`--user-only` 保留机器配置。夏令时使用 IANA 规则，不保存固定 UTC 偏移。
+地区仍为 `us`，`LANG`、`LC_ALL` 保持 `en_US.UTF-8`，浏览器语言策略不随美国城市改变。所选时区进入 Bash、原生 Claude/VS Code 设置、Claude Desktop 启动器以及完整模式下的机器配置；不再写入桌面会话环境或包装浏览器、VS Code 桌面入口。`--user-only` 保留机器配置。夏令时使用 IANA 规则，不保存固定 UTC 偏移。
 
 `status/off/recover` 在状态读取或事务结束后查询 IP，展示即时观察，不重新选择目标。恢复依据保存的 journal 和 committed desired。`check/run` 优先沿用同地区已保存时区；没有保存目标时可为该次只读检测或子进程选择 IP 时区，不改变持久配置。`check/run --timezone` 可覆盖当次目标。
 
@@ -66,7 +66,7 @@ Firefox 使用 `/etc/firefox/policies/policies.json` 的 `policies.Preferences`�
 
 这三个 ICE 偏好采用 [Firefox WebExtension 的官方映射](https://github.com/mozilla-firefox/firefox/blob/main/toolkit/components/extensions/parent/ext-privacy.js)，限制地址暴露并在网页实际使用浏览器代理时限制 ICE 连接。它们不配置代理路由，不关闭 WebRTC，也不保证透明代理下全部直连 UDP 被阻断。FUCC 保留其他 Preferences、策略、WebRTC 开关和抗指纹设置；抗指纹保护可能向网页报告 UTC。
 
-原生安装与确认已连接 `etc-firefox` 的 Snap 使用宿主策略。发现过程只读检查可信文件和固定 `/usr/bin/snap connections firefox`，不会执行浏览器或自动连接接口。Flatpak 暂不支持。原生桌面入口通过用户 launcher 加载环境，Snap 不注入 launcher 环境；系统时区和机器策略仍覆盖它。`--user-only` 不更新机器策略。
+原生安装与确认已连接 `etc-firefox` 的 Snap 使用宿主策略。发现过程只读检查可信文件和固定 `/usr/bin/snap connections firefox`，不会执行浏览器或自动连接接口。Flatpak 暂不支持。0.0.5 的浏览器桌面入口不注入 launcher 环境；系统时区和机器策略提供原生配置。`--user-only` 不更新机器策略。
 
 Firefox 优先读取 `/etc` 策略，不与安装目录的 `distribution/policies.json` 合并。发现既有 distribution 策略但尚无 `/etc` 文件时，FUCC 拒绝新增该策略文件并在状态中说明，避免遮蔽现有策略。政策文件有重复 JSON 键、错误结构、链接、特殊文件或不可信路径时同样拒绝修改。合并保留无关内容，整份原始文件及权限由私有机器事务保存；关闭时精确还原，未知外部修改阻止覆盖。配置文件对齐仍不代表浏览器已接受策略，需完全退出重开，在 `about:policies` 的 Active / Errors 核实。
 
@@ -83,3 +83,15 @@ Firefox 优先读取 `/etc` 策略，不与安装目录的 `distribution/policie
 恢复日志保持 v1/v2/v3 格式，`before` 仍保存已提交 desired，目标为 original。既有写入逻辑接受这两个已知值，因此能继续处理中断恢复的混合状态，也不会重写已经恢复的原始文件。用户整文件资源写入沿用最近一次读取并校验的快照作为原子替换的 expected，校验后发生的未知编辑不会被一次新的读取升级为可覆盖的预期值。
 
 已有旧版受管入口仍对齐时，再次 `on` 可提交停用生成标记的新包装，首次 original 不变。若客户端已经将入口精确恢复为 original，应先完全退出客户端并执行 `off`，再开启 FUCC；不放宽 `on` 的冲突检查。此修补自 `0.0.3` 起支持，`0.0.4` 沿用现有状态和备份，无需转换或删除。
+
+## 0.0.5 原生配置与旧覆盖迁移
+
+系统时区仍通过既有机器事务调用 `timedatectl set-timezone`，语言和 WebRTC 仍使用浏览器机器策略。Claude Code 使用 `settings.json.env`，VS Code 的 Claude 进程使用 `claudeCode.environmentVariables`。Bash 的三键与 `fucc run` 保留；只有受管原生 Claude Desktop 入口需要用户 launcher。新配置不登记 `session-environment`，没有受管 Claude Desktop 时也不创建 `app-launcher`。
+
+升级时从全部已保存绑定重建精确资源集合，不删除旧资源、重采 original 或放宽外部编辑校验。再次 `on` 把旧 `session-environment`、非 Claude Desktop 的桌面覆盖，以及不再需要的 launcher 的 desired 设置为已提交 original。原文件存在时恢复内容和权限，原文件不存在时删除 FUCC 覆盖。退休资源仍保留在活动账本中；后续切区继续核验它们，完整 `off` 清空活动登记后，下次开启才使用精简的新集合。
+
+迁移沿用 v1/v2/v3：id/identity 不变、original 不变、journal.before 仍是迁移前 desired，因此失败或 apply 中断补偿回完整旧配置；restore 中断继续还原首次 original。读取退休基线必须在旧绑定协调器上完成，不能读取当前文件当基线。退休文件后续出现未知修改仍阻止事务，不能因其已停止环境注入而覆盖用户编辑。
+
+JSON 的 `configurationModel`、`nativeMigrationRequired`、`retirementPendingResources` 区分尚未迁移的活动状态与原生配置；`retiredResources` 仅列已提交原始值的旧登记。浏览器状态按 Chrome、Chromium、Edge、Firefox 精确关联机器策略；VS Code 状态核验原生扩展配置，Claude Desktop 状态核验受管入口。
+
+FUCC 不再向桌面会话写入固定 `TZ`。这不会改写已有 GNOME、浏览器或父终端的进程环境，也不会改写用户原先的其他环境配置。Chromium 在启动环境没有 `TZ` 时才监控系统时区；已有固定 `TZ` 仍可能覆盖系统设置。配置健康只证明文件和机器目标对齐，`applicationRuntimeVerified` 始终为 false，浏览器实际策略和时区仍需应用内核实。`check` 的进程信号来自当前 Python CLI，不代表浏览器或 Claude 运行时。

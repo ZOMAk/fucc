@@ -1,4 +1,4 @@
-"""Bidirectional lifecycle compatibility with the actual TypeScript predecessor."""
+"""Restore predecessor baselines and reject incompatible native resource sets."""
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -115,37 +115,34 @@ def fixture(tmp_path):
     return environment, applications, machine_path, machine, claude, vscode, originals
 
 
-@pytest.mark.parametrize("initial", ["legacy", "python"])
-def test_full_runtime_on_switch_off_cross_language(tmp_path, legacy_runtime_bundle, initial):
+def test_legacy_runtime_migrates_to_native_and_restores_initial_baselines(tmp_path, legacy_runtime_bundle):
     environment, applications, machine_path, machine, claude, vscode, originals = fixture(tmp_path)
+    assert legacy(legacy_runtime_bundle, environment, applications, machine_path, "on", "us")["result"]["kind"] == "committed"
     runtime = LocalRuntime(environment, [str(applications)], machine, lambda: LOCALES)
-    if initial == "legacy":
-        assert legacy(legacy_runtime_bundle, environment, applications, machine_path, "on", "us")["result"]["kind"] == "committed"
-    else:
-        assert runtime.on("us")["kind"] == "committed"
-    status = LocalRuntime(environment, [str(applications)], machine, lambda: LOCALES).status()
+    status = runtime.status()
     old_status = legacy(legacy_runtime_bundle, environment, applications, machine_path, "status")["status"]
     for key in ("region", "revision", "active", "health", "transaction", "configured", "resources", "paths"):
         assert status[key] == old_status[key]
     launcher = Path(status["paths"]["launcher"])
-    assert launcher.read_text() == runtime.user.desired("us")["app-launcher"]["text"]
+    assert '# FUCC application environment launcher' in launcher.read_text()
+    assert 'exec "$@"' in launcher.read_text()
     ledger_path = persist_root(environment) / "local" / "local-transaction.json"
     originals_in_ledger = {item["id"]: deepcopy(item["original"]) for item in json.loads(ledger_path.read_text())["payload"]["committed"]["resources"]}
-    # User additions remain outside the managed projection on either writer.
+    # User additions remain outside the managed projection during migration.
     claude.write_text(edit(claude.read_text(), ["env", "TOKEN"], "user-updated"))
     vscode.write_text(edit(vscode.read_text(), ["claudeCode.environmentVariables", -1], {"name": "USER_ADDED", "value": "later"}))
-    if initial == "legacy":
-        assert LocalRuntime(environment, [str(applications)], machine, lambda: LOCALES).on("jp")["kind"] == "committed"
-    else:
-        assert legacy(legacy_runtime_bundle, environment, applications, machine_path, "on", "jp")["result"]["kind"] == "committed"
+    assert runtime.on("jp")["kind"] == "committed"
     switched = json.loads(ledger_path.read_text())["payload"]["committed"]
     assert {item["id"]: item["original"] for item in switched["resources"]} == originals_in_ledger
-    assert LocalRuntime(environment, [str(applications)], machine, lambda: LOCALES).status()["health"] == "healthy"
-    assert legacy(legacy_runtime_bundle, environment, applications, machine_path, "status")["status"]["health"] == "healthy"
-    if initial == "legacy":
-        assert legacy(legacy_runtime_bundle, environment, applications, machine_path, "off")["result"]["kind"] == "restored"
-    else:
-        assert LocalRuntime(environment, [str(applications)], machine, lambda: LOCALES).off()["kind"] == "restored"
+    native_status = runtime.status()
+    assert native_status["health"] == "healthy" and native_status["configurationModel"] == "native-first"
+    retired = set(native_status["retiredResources"])
+    assert {"session-environment", "app-launcher", "desktop.google-chrome.desktop"} <= retired
+    assert all(item["desired"] == item["original"] for item in switched["resources"] if item["id"] in retired)
+    assert not launcher.exists() and not Path(status["paths"]["sessionFile"]).exists()
+    assert Path(next(path for path in originals if path.endswith("google-chrome.desktop"))).read_text() == next(
+        contents for path, contents in originals.items() if path.endswith("google-chrome.desktop"))
+    assert LocalRuntime(environment, [str(applications)], machine, lambda: LOCALES).off()["kind"] == "restored"
     assert all(Path(path).read_text() == contents for path, contents in originals.items())
     assert json.loads(claude.read_text()) == {"env": {"TZ": None, "TOKEN": "user-updated"}, "model": "original"}
     rows = parse(vscode.read_text())["claudeCode.environmentVariables"]
@@ -157,6 +154,27 @@ def test_full_runtime_on_switch_off_cross_language(tmp_path, legacy_runtime_bund
     assert not launcher.exists()
     assert machine.read() == {"active": False, "region": None, "ownerUid": None}
     assert not Path(status["paths"]["sessionFile"]).exists()
+
+
+def test_fresh_native_runtime_is_rejected_by_legacy_without_writes(tmp_path, legacy_runtime_bundle):
+    environment, applications, machine_path, machine, _, _, originals = fixture(tmp_path)
+    runtime = LocalRuntime(environment, [str(applications)], machine, lambda: LOCALES)
+    assert runtime.on("us")["kind"] == "committed"
+    status = runtime.status()
+    assert status["health"] == "healthy"
+    ids = {item["id"] for item in status["resources"]}
+    assert ids == {"bash-profile", "claude-settings", "vscode-settings", "machine"}
+    assert not Path(status["paths"]["launcher"]).exists()
+    assert not Path(status["paths"]["sessionFile"]).exists()
+    before = {str(path): (path.read_bytes(), path.stat().st_mode & 0o777) for path in tmp_path.rglob("*") if path.is_file()}
+    for verb in ("on", "off", "recover"):
+        rejected = legacy(legacy_runtime_bundle, environment, applications, machine_path, verb, "jp")
+        assert rejected["result"]["kind"] == "recovery_required"
+        assert rejected["status"]["health"] == "recovery_required"
+        assert {str(path): (path.read_bytes(), path.stat().st_mode & 0o777) for path in tmp_path.rglob("*") if path.is_file()} == before
+    assert runtime.status()["health"] == "healthy"
+    assert runtime.off()["kind"] == "restored"
+    assert all(Path(path).read_text() == contents for path, contents in originals.items())
 
 
 def test_inactive_local_status_reports_standalone_bash_conflict(tmp_path):

@@ -115,7 +115,8 @@ def _local_rows(status, network, selection=None):
         *_network_rows(network),
         *(([("Timezone selection", f"{selection['source']}: {selection['timezone']}"),
              ("Selection detail", selection["reason"])]) if selection else []),
-        ("Scope", "Local Claude: Bash, native settings, desktop launchers, machine profile"),
+        ("Scope", "Legacy configuration; run fucc on to migrate" if status.get("nativeMigrationRequired") else
+         "Native settings, system timezone/policies, Claude Desktop launcher, Bash"),
         *((key, (status["configured"] or {}).get(key, "none")) for key in ("TZ", "LANG", "LC_ALL")),
         ("Resources aligned", f"{sum(item['aligned'] for item in status['resources'])}/{len(status['resources'])}"),
         ("Machine profile", f"{status['machine']['region'] if status['machine']['active'] else 'off / unknown'}; {status['machine']['health']}"),

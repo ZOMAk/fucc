@@ -1,4 +1,4 @@
-"""User-scoped Claude, VS Code, session, and desktop-entry adapters."""
+"""Native user settings, Claude Desktop launchers, and legacy resource restoration."""
 from __future__ import annotations
 
 import hashlib
@@ -253,11 +253,13 @@ def _application_kind(identity: str, text: str) -> dict | None:
     command = re.search(r"^Exec=(.*)$", text, re.M)
     identity += "\n" + (name[1] if name else "") + "\n" + (command[1] if command else "")
     if re.search(r"google[.-]?chrome|com\.google\.Chrome|\bchromium\b", identity, re.I):
-        return {"kind": "chrome", "name": "Chromium" if re.search("chromium", identity, re.I) else "Google Chrome"}
+        chromium = bool(re.search("chromium", identity, re.I))
+        browser_id = "chromium-browser" if re.search(r"\bchromium-browser\b", identity, re.I) else "chromium" if chromium else "chrome"
+        return {"kind": "chrome", "browserId": browser_id, "name": "Chromium" if chromium else "Google Chrome"}
     if re.search(r"microsoft[.-]?edge|\bmsedge\b", identity, re.I):
-        return {"kind": "edge", "name": "Microsoft Edge"}
+        return {"kind": "edge", "browserId": "edge", "name": "Microsoft Edge"}
     if re.search(r"\bfirefox\b|org\.mozilla\.firefox", identity, re.I):
-        return {"kind": "firefox", "name": "Firefox"}
+        return {"kind": "firefox", "browserId": "firefox", "name": "Firefox"}
     if re.search(r"com\.microsoft\.VSCode|visual studio code|(?:^|[\s/])code(?:-url-handler|\.desktop|\s|$)", identity, re.I):
         return {"kind": "vscode", "name": "Visual Studio Code"}
     if re.search(r"\bclaude\b", identity, re.I):
@@ -290,8 +292,9 @@ class UserAdapters:
     paths: dict[str, str]
     desired_files: dict
     launcher: str
+    retired_ids: set[str]
 
-    def desired(self, region: str, timezone: str | None = None) -> dict:
+    def desired(self, region: str, timezone: str | None = None, retired_originals: Mapping[str, dict] | None = None) -> dict:
         target = get_target_region(region, timezone)
         env = {"TZ": target["timezone"], "LANG": target["lang"], "LC_ALL": target["lcAll"]}
         desktop_paths = {resource.id: resource.identity for resource in self.resources if resource.id in self.desired_files}
@@ -299,16 +302,26 @@ class UserAdapters:
             resource_id: dict(snapshot) if snapshot["text"] is None else {"text": wrap_desktop_entry(snapshot["text"], self.paths["launcher"], identity=os.path.basename(desktop_paths[resource_id])), "mode": 0o644}
             for resource_id, snapshot in self.desired_files.items()
         }
-        return {
-            "session-environment": {"text": "# FUCC managed environment\n" + "".join(f"{key}={env[key]}\n" for key in KEYS), "mode": 0o600},
-            "app-launcher": {"text": self.launcher, "mode": 0o755},
+        desired = {
             "claude-settings": {key: {"present": True, "value": env[key]} for key in KEYS},
             "vscode-settings": {key: [{"present": True, "value": env[key]}] for key in KEYS},
             **desktop_files,
         }
+        if any(resource.id == "app-launcher" for resource in self.resources) and "app-launcher" not in self.retired_ids:
+            desired["app-launcher"] = {"text": self.launcher, "mode": 0o755}
+        for resource_id in self.retired_ids:
+            original = (retired_originals or {}).get(resource_id)
+            if not isinstance(original, dict) or set(original) != {"text", "mode"}:
+                raise _conflict("退休资源缺少已提交的原始快照")
+            # Never infer a retirement baseline from the current, possibly
+            # managed file. Only the transaction's original can restore it.
+            desired[resource_id] = dict(original)
+        if set(desired) != {resource.id for resource in self.resources}:
+            raise _conflict("用户资源目标与已保存绑定不一致")
+        return desired
 
 
-def create_user_adapters(environment: Mapping[str, str] | None = None, application_dirs: list[str] | None = None, managed_desktop_files: list[dict] | None = None, *, enroll_firefox: bool = False) -> UserAdapters:
+def create_user_adapters(environment: Mapping[str, str] | None = None, application_dirs: list[str] | None = None, managed_desktop_files: list[dict] | None = None, *, managed_resources: list[dict] | None = None, enroll_firefox: bool = False) -> UserAdapters:
     environment = os.environ if environment is None else environment
     home = _home(environment)
     config_home = _config_home(environment)
@@ -327,23 +340,54 @@ def create_user_adapters(environment: Mapping[str, str] | None = None, applicati
         "claudeSettings": os.path.join(environment.get("CLAUDE_CONFIG_DIR", os.path.join(home, ".claude")), "settings.json"),
         "vscodeSettings": os.path.join(config_home, "Code", "User", "settings.json"),
     }
-    resources = [snapshot_resource("session-environment", paths["sessionFile"]), snapshot_resource("app-launcher", paths["launcher"]), claude_resource(paths["claudeSettings"]), vscode_resource(paths["vscodeSettings"])]
+    resources = [claude_resource(paths["claudeSettings"]), vscode_resource(paths["vscodeSettings"])]
     applications = []
     desired_files = {}
-    bound = managed_desktop_files
-    if bound is not None:
-        bound_ids, bound_paths = set(), set()
-        for entry in bound:
+    retired_ids = set()
+    bound = None if managed_resources is None and managed_desktop_files is None else []
+    saved_ids, saved_paths = {}, set()
+    fixed = {"session-environment": paths["sessionFile"], "app-launcher": paths["launcher"],
+             "claude-settings": paths["claudeSettings"], "vscode-settings": paths["vscodeSettings"]}
+    for entries in (managed_resources, managed_desktop_files):
+        group_ids, group_paths = set(), set()
+        for entry in entries or []:
+            if (not isinstance(entry, dict) or not isinstance(entry.get("id"), str)
+                    or not isinstance(entry.get("identity"), str)):
+                raise _conflict("已保存用户资源绑定无效")
             identity, resource_id = entry["identity"], entry["id"]
-            if not os.path.isabs(identity) or os.path.dirname(identity) != user_applications or not os.path.basename(identity).endswith(".desktop") or resource_id != desktop_resource_id(os.path.basename(identity)) or resource_id in bound_ids or identity in bound_paths:
+            if resource_id in group_ids or identity in group_paths:
+                raise _conflict("已保存用户资源绑定重复")
+            group_ids.add(resource_id)
+            group_paths.add(identity)
+            if not resource_id.startswith("desktop.") and resource_id not in fixed:
+                continue  # Bash and machine resources belong to other adapters.
+            if resource_id in saved_ids:
+                if saved_ids[resource_id] != identity:
+                    raise _conflict("已保存用户资源绑定冲突")
+                continue  # The two compatible arguments can describe the same binding.
+            if identity in saved_paths:
+                raise _conflict("已保存用户资源路径重复")
+            saved_ids[resource_id] = identity
+            saved_paths.add(identity)
+            if resource_id in fixed:
+                if identity != fixed[resource_id]:
+                    raise _conflict("已保存用户资源绑定不属于当前用户配置路径")
+                if resource_id in ("session-environment", "app-launcher"):
+                    resources.append(snapshot_resource(resource_id, identity))
+                    retired_ids.add(resource_id)
+                continue
+            if not os.path.isabs(identity) or os.path.dirname(identity) != user_applications or not os.path.basename(identity).endswith(".desktop") or resource_id != desktop_resource_id(os.path.basename(identity)):
                 raise _conflict("已保存桌面入口绑定不属于当前用户应用目录")
-            bound_ids.add(resource_id)
-            bound_paths.add(identity)
+            bound.append({"id": resource_id, "identity": identity})
             current = read_snapshot(identity)
             resources.append(snapshot_resource(resource_id, identity))
-            # Restoration uses the saved transaction snapshots, so constructing
-            # adapters must not require a new, safely wrappable on target.
-            desired_files[resource_id] = dict(current)
+            # Recovery must construct old bindings even when their current
+            # contents cannot safely be used to generate a new launcher.
+            kind = _application_kind(os.path.basename(identity), current["text"] or "")
+            if kind and kind["kind"] == "claude":
+                desired_files[resource_id] = dict(current)
+            else:
+                retired_ids.add(resource_id)
     seen = set()
     for directory in directories:
         for relative in _desktop_files(directory):
@@ -366,36 +410,56 @@ def create_user_adapters(environment: Mapping[str, str] | None = None, applicati
                 continue
             application = {"id": identity, **kind, "desktopFile": source, "supported": False}
             sandboxed = re.search(r"(?:^|[\s/])(?:flatpak|snap)(?:\s|/)|^X-(?:Flatpak|SnapInstanceName)=|/snap/", snapshot["text"], re.M) or re.search(r"(?:flatpak|snapd)/", str(directory))
+            flatpak = re.search(r"\bflatpak\b|^X-Flatpak=", snapshot["text"], re.M) or "flatpak/" in str(directory)
+            application["installation"] = "flatpak" if flatpak else "snap" if sandboxed else "native"
+            if kind["kind"] != "claude":
+                adaptation = "native-settings" if kind["kind"] == "vscode" else "system-policy"
+                hidden = re.search(r"^Hidden=true\s*$", snapshot["text"], re.M)
+                supported = not hidden and not flatpak and not (sandboxed and kind["kind"] == "vscode")
+                reason = ("桌面入口已隐藏" if hidden else "Flatpak 配置路径尚未适配" if flatpak else
+                          "沙箱 VS Code 的用户配置路径尚未适配" if sandboxed and kind["kind"] == "vscode" else
+                          "使用 Claude Code 原生环境设置；不改写 VS Code 桌面入口" if kind["kind"] == "vscode" else
+                          "使用机器浏览器策略及系统时区；实际覆盖以机器策略状态为准")
+                applications.append({**application, "supported": bool(supported), "adaptation": adaptation, "reason": reason})
+                continue
             if sandboxed:
-                snap_firefox = kind["kind"] == "firefox" and not re.search(r"\bflatpak\b|^X-Flatpak=", snapshot["text"], re.M) and "flatpak/" not in str(directory)
-                applications.append({**application, "reason": "Snap Firefox 使用机器策略；沙箱入口不注入环境变量" if snap_firefox else "Snap / Flatpak 沙箱入口尚不支持环境继承"})
+                applications.append({**application, "adaptation": "launcher", "reason": "Snap / Flatpak 沙箱入口尚不支持环境继承"})
                 continue
             if re.search(r"^Hidden=true\s*$", snapshot["text"], re.M):
-                applications.append({**application, "reason": "桌面入口已隐藏"})
+                applications.append({**application, "adaptation": "launcher", "reason": "桌面入口已隐藏"})
                 continue
             destination = os.path.join(user_applications, identity)
+            resource_id = desktop_resource_id(identity)
+            enrolled = bound is not None and any(entry["id"] == resource_id for entry in bound)
+            if enrolled:
+                applications.append({**application, "supported": True, "adaptation": "launcher"})
+                continue
             try:
                 contents = wrap_desktop_entry(snapshot["text"], paths["launcher"], identity=identity, kind=kind["kind"])
                 read_snapshot(destination)
-                resource_id = desktop_resource_id(identity)
-                enrolled = bound is None or any(entry["id"] == resource_id for entry in bound)
-                if bound is None or (enroll_firefox and kind["kind"] == "firefox" and not enrolled):
+                if bound is None:
                     resources.append(snapshot_resource(resource_id, destination))
                     desired_files[resource_id] = {"text": contents, "mode": 0o644}
                     enrolled = True
-                reason = "运行 fucc on 接入 Firefox" if kind["kind"] == "firefox" else "开启期间发现新入口；请先关闭再开启 FUCC 以接入"
-                applications.append({**application, "supported": enrolled, **({} if enrolled else {"reason": reason})})
+                reason = "开启期间发现新入口；请先关闭再开启 FUCC 以接入"
+                applications.append({**application, "supported": enrolled, "adaptation": "launcher", **({} if enrolled else {"reason": reason})})
             except (OSError, FuccError):
-                applications.append({**application, "reason": "桌面入口格式或用户覆盖路径不支持安全适配"})
+                applications.append({**application, "adaptation": "launcher", "reason": "桌面入口格式或用户覆盖路径不支持安全适配"})
     for entry in bound or []:
         identity = os.path.basename(entry["identity"])
         if not any(application["id"] == identity for application in applications):
             snapshot = read_snapshot(entry["identity"])
             kind = _application_kind(identity, snapshot["text"] or "") or {"kind": "application", "name": identity}
-            applications.append({"id": identity, **kind, "desktopFile": entry["identity"], "supported": snapshot["text"] is not None, "reason": "已保存受管入口缺失；需要恢复配置冲突" if snapshot["text"] is None else "使用已保存的用户桌面入口"})
+            applications.append({"id": identity, **kind, "desktopFile": entry["identity"], "supported": snapshot["text"] is not None,
+                                 "adaptation": "launcher" if entry["id"] in desired_files else "native-settings" if kind["kind"] == "vscode" else "system-policy",
+                                 "reason": "已保存受管入口缺失；需要恢复配置冲突" if snapshot["text"] is None else "保留已保存桌面入口绑定以恢复原始配置"})
     for kind, name in (("chrome", "Chrome / Chromium"), ("firefox", "Firefox"), ("vscode", "Visual Studio Code"), ("claude", "Claude Desktop")):
         if not any(application["kind"] == kind for application in applications):
             applications.append({"id": kind, "kind": kind, "name": name, "desktopFile": None, "supported": False, "reason": "未发现本机桌面入口"})
     env_path = os.path.join(config_home, "fucc", "env.sh")
     launcher = f'#!/bin/sh\n# FUCC application environment launcher\nif [ -r {_shell_quote(env_path)} ]; then\n  . {_shell_quote(env_path)}\nfi\nexec "$@"\n'
-    return UserAdapters(resources, applications, paths, desired_files, launcher)
+    if desired_files:
+        if "app-launcher" not in saved_ids:
+            resources.append(snapshot_resource("app-launcher", paths["launcher"]))
+        retired_ids.discard("app-launcher")
+    return UserAdapters(resources, applications, paths, desired_files, launcher, retired_ids)
