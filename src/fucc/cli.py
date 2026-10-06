@@ -356,6 +356,11 @@ def main(arguments=None):
             print(f"Error [{identifier}]: {exc}", file=sys.stderr)
         return code
     except KeyboardInterrupt:
+        message = "已取消。若操作已经开始，状态和恢复日志会保留；可重试 fucc off 继续关闭，或运行 fucc recover。"
+        if structured:
+            json_output({"schemaVersion": 1, "ok": False, "error": {"id": "CANCELLED", "code": 130, "message": message}})
+        else:
+            print(f"Error [CANCELLED]: {message}", file=sys.stderr)
         return 130
     except BrokenPipeError:
         return 0

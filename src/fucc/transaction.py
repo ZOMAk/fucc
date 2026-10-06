@@ -281,7 +281,8 @@ def _locale_key(id: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
 
 class LocalTransaction:
     def __init__(self, root: str | Path, resources: Iterable[Resource],
-                 before_recover: Callable[[], None] | None = None, wire_version: int = 1):
+                 before_recover: Callable[[], None] | None = None, wire_version: int = 1,
+                 before_mutation: Callable[[list[dict[str, Any]]], None] | None = None):
         if type(wire_version) is not int or wire_version not in SCHEMAS:
             raise FuccError("Local transaction wire version must be 1, 2 or 3")
         self.wire_version = wire_version
@@ -294,6 +295,7 @@ class LocalTransaction:
             raise FuccError("Local transaction requires a nonempty set of uniquely identified resources")
         self.resources.sort(key=lambda resource: _locale_key(resource.id))
         self.before_recover = before_recover
+        self.before_mutation = before_mutation
         self.path = self.root / "local-transaction.json"
         self.lock_key = f"{self.root}\0local-transaction"
 
@@ -368,6 +370,32 @@ class LocalTransaction:
         if not _equal(self._read(resource), value):
             raise _unsafe()
 
+    def _prepare(self, entries: list[dict[str, Any]]) -> None:
+        """Authorize actual writes before publishing a plan, then recheck it.
+
+        Authentication can wait for human input. Preserve every observed value
+        across that wait, including resources that do not need a write.
+        """
+        if self.before_mutation is None:
+            return
+        observed = []
+        changes = []
+        for entry in entries:
+            resource = next((item for item in self.resources
+                             if item.id == entry["id"] and item.identity == entry["identity"]), None)
+            if resource is None:
+                raise _unsafe()
+            actual = self._read(resource)
+            if not _equal(actual, entry["before"]) and not _equal(actual, entry["desired"]):
+                raise _unsafe()
+            observed.append((resource, actual))
+            if not _equal(actual, entry["desired"]):
+                changes.append({**entry, "before": actual})
+        if changes and self.before_mutation is not None:
+            self.before_mutation(clone_json(changes))
+            if any(not _equal(self._read(resource), actual) for resource, actual in observed):
+                raise _unsafe()
+
     def _publish(self, journal: dict[str, Any]) -> None:
         document = {"version": 1, "committed": journal["previous"], "journal": journal}
         # Both generations must carry the same plan before touching resources.
@@ -438,11 +466,9 @@ class LocalTransaction:
                 self._effective_wire_version = max(self._effective_wire_version, wire_version or self.wire_version,
                                                    3 if enroll else 1)
                 before = self._actual(document["committed"] if document is not None else EMPTY, enroll=enroll)
-                if document is None:
-                    document = self._initialize()
             except Exception:
                 return {"kind": "recovery_required"}
-            previous = document["committed"]
+            previous = document["committed"] if document is not None else clone_json(EMPTY)
             if self._bound(previous) and previous["region"] == region and all(_equal(value, target_values[resource.id])
                                                       for resource, value in zip(self.resources, before)):
                 return {"kind": "noop"}
@@ -459,6 +485,12 @@ class LocalTransaction:
             journal = {"kind": "apply", "previous": previous, "target": target,
                        "entries": [{"id": resource.id, "identity": resource.identity, "before": before[index], "desired": target_values[resource.id]}
                                    for index, resource in enumerate(self.resources)]}
+            self._prepare(journal["entries"])
+            if document is None:
+                try:
+                    self._initialize()
+                except Exception:
+                    return {"kind": "recovery_required"}
             try:
                 self._publish(journal)
                 for entry in journal["entries"]:
@@ -469,10 +501,15 @@ class LocalTransaction:
                 return {"kind": "compensated" if self._compensate(journal) else "recovery_required"}
         return self._locked(action)
 
-    def restore(self) -> dict[str, str]:
+    def restore(self, *, resume: bool = False) -> dict[str, str]:
+        if type(resume) is not bool:
+            raise FuccError("Local restore resumption must be explicitly enabled or disabled")
         def action() -> dict[str, str]:
             try:
                 document, degraded = self._load()
+                if resume and document is not None and document["journal"] is not None and document["journal"]["kind"] == "restore":
+                    result = self._recover_action(expected_kind="restore")
+                    return {"kind": "restored" if result["kind"] == "recovered" else result["kind"]}
                 if degraded or document is not None and document["journal"] is not None:
                     return {"kind": "recovery_required"}
                 previous = document["committed"] if document is not None else None
@@ -489,40 +526,53 @@ class LocalTransaction:
                        "entries": [{"id": resource["id"], "identity": resource["identity"],
                                     "before": resource["desired"], "desired": resource["original"]}
                                    for resource in previous["resources"]]}
+            self._prepare(journal["entries"])
             try:
                 self._publish(journal)
             except Exception:
                 return {"kind": "recovery_required"}
             return {"kind": "restored" if self._forward_restore(journal) else "recovery_required"}
-        return self._locked(action)
+        return self._locked(action, recover=resume)
 
-    def recover(self) -> dict[str, str]:
-        def action() -> dict[str, str]:
+    def _recover_action(self, expected_kind: str | None = None) -> dict[str, str]:
+        def expected(document):
+            return expected_kind is None or (document is not None and document["journal"] is not None
+                                            and document["journal"]["kind"] == expected_kind)
+        try:
+            document, degraded = self._load()
+            if not expected(document) or document is not None and not self._document_bound(document):
+                return {"kind": "recovery_required"}
+            if self.before_recover is not None:
+                self.before_recover()
+            document, degraded = self._load()
+        except Exception:
+            return {"kind": "recovery_required"}
+        if not expected(document):
+            return {"kind": "recovery_required"}
+        if document is None:
+            return {"kind": "noop"}
+        if not self._document_bound(document):
+            return {"kind": "recovery_required"}
+        if document["journal"] is None:
+            if degraded:
+                return {"kind": "recovery_required"}
             try:
-                document, degraded = self._load()
-                if document is not None and not self._document_bound(document):
-                    return {"kind": "recovery_required"}
-                if self.before_recover is not None:
-                    self.before_recover()
-                document, degraded = self._load()
+                self._actual(document["committed"])
+                return {"kind": "noop"}
             except Exception:
                 return {"kind": "recovery_required"}
-            if document is None:
-                return {"kind": "noop"}
-            if not self._document_bound(document):
-                return {"kind": "recovery_required"}
-            if document["journal"] is None:
-                if degraded:
-                    return {"kind": "recovery_required"}
-                try:
-                    self._actual(document["committed"])
-                    return {"kind": "noop"}
-                except Exception:
-                    return {"kind": "recovery_required"}
-            journal = document["journal"]
-            recovered = self._compensate(journal) if journal["kind"] == "apply" else self._forward_restore(journal)
-            return {"kind": "recovered" if recovered else "recovery_required"}
-        return self._locked(action, recover=True)
+        journal = document["journal"]
+        entries = journal["entries"] if journal["kind"] == "restore" else [
+            {**entry, "before": entry["desired"], "desired": entry["before"]} for entry in journal["entries"]]
+        try:
+            self._prepare(entries)
+        except Exception:
+            return {"kind": "recovery_required"}
+        recovered = self._compensate(journal) if journal["kind"] == "apply" else self._forward_restore(journal)
+        return {"kind": "recovered" if recovered else "recovery_required"}
+
+    def recover(self) -> dict[str, str]:
+        return self._locked(self._recover_action, recover=True)
 
     def status(self) -> dict[str, Any]:
         try:

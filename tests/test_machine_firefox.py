@@ -196,11 +196,11 @@ def test_firefox_machine_descriptor_and_helper_arguments_are_explicit(machine):
         return type("Result", (), {"returncode": 0, "stdout": json.dumps({"scope": "machine", "active": True,
                     "region": "us", "ownerUid": 1000, "recoveryRequired": False, "firefoxManaged": managed})})()
 
-    with patch("fucc.machine.subprocess.run", side_effect=helper):
+    with patch("fucc.machine._run_helper", side_effect=helper):
         adapter.resource.write(adapter.desired("us"))
     assert calls[0][-2:] == ["--firefox", "on"]
     action(machine, "on", "us", firefox=True)
-    with patch("fucc.machine.subprocess.run", side_effect=helper):
+    with patch("fucc.machine._run_helper", side_effect=helper):
         adapter.resource.write({"active": True, "region": "us", "ownerUid": 1000})
     assert calls[-1][-2:] == ["--firefox", "off"]
     assert _valid_switch({"active": True, "region": "us", "ownerUid": 1000, "firefox": True})

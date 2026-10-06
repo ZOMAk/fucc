@@ -53,7 +53,16 @@ class LocalRuntime:
         resource = Resource("bash-profile", str(persist_root(self.environment)), self._read_bash, self._write_bash,
                             lambda value: {"region": None})
         return LocalTransaction(self.root, [resource, *user.resources, self.machine.resource],
-                                before_recover=self._recover_nested)
+                                before_recover=self._recover_nested, before_mutation=self._authorize_changes)
+
+    def _authorize_machine(self):
+        authorize = getattr(self.machine, "authorize", None)
+        if authorize is not None:
+            authorize()
+
+    def _authorize_changes(self, entries):
+        if any(entry["id"] == self.machine.resource.id and entry["before"] != entry["desired"] for entry in entries):
+            self._authorize_machine()
 
     def _reload_bindings(self):
         bindings = read_resource_bindings(self.root)
@@ -85,10 +94,12 @@ class LocalRuntime:
     def _recover_nested(self):
         try:
             if self.machine.inspect()["recoveryRequired"]:
+                self._authorize_machine()
                 self.machine.recover()
         except FuccError as exc:
             if exc.code != "MACHINE_STATE_INVALID":
                 raise
+            self._authorize_machine()
             self.machine.recover()
         status = self.bash.status()
         if status["health"] == "recovery_required" or status["transaction"]["kind"] != "none":
@@ -149,7 +160,10 @@ class LocalRuntime:
         return result
 
     def off(self):
-        return self.transaction.restore()
+        result = self.transaction.restore(resume=True)
+        if result["kind"] in ("restored", "noop"):
+            self._reload_bindings()
+        return result
 
     def recover(self):
         result = self.transaction.recover()

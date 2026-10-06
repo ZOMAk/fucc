@@ -95,3 +95,11 @@ Firefox 优先读取 `/etc` 策略，不与安装目录的 `distribution/policie
 JSON 的 `configurationModel`、`nativeMigrationRequired`、`retirementPendingResources` 区分尚未迁移的活动状态与原生配置；`retiredResources` 仅列已提交原始值的旧登记。浏览器状态按 Chrome、Chromium、Edge、Firefox 精确关联机器策略；VS Code 状态核验原生扩展配置，Claude Desktop 状态核验受管入口。
 
 FUCC 不再向桌面会话写入固定 `TZ`。这不会改写已有 GNOME、浏览器或父终端的进程环境，也不会改写用户原先的其他环境配置。Chromium 在启动环境没有 `TZ` 时才监控系统时区；已有固定 `TZ` 仍可能覆盖系统设置。配置健康只证明文件和机器目标对齐，`applicationRuntimeVerified` 始终为 false，浏览器实际策略和时区仍需应用内核实。`check` 的进程信号来自当前 Python CLI，不代表浏览器或 Claude 运行时。
+
+## 管理员认证与关闭中断
+
+外层事务的 `before_mutation` 在锁内完成绑定及实际值校验后执行，认证成功并再次验证所有观察值，才初始化状态或发布 journal。回调接收确实需要写入的条目，`before` 为刚验证的当前值；仅实际机器目标变化时调用绝对 `/usr/bin/sudo -v`，用户模式、无变化或机器资源已还原不请求认证。等待密码期间出现未知修改时，拒绝发布新日志或写配置。
+
+机器助手固定使用 `sudo -n --`，写入阶段不再交互索取密码；认证缓存失效或命令权限不足仍可能使助手失败，已有日志继续保留以便恢复。stdin/stderr 和终端会话保持原状，环境仅保留固定 PATH 与 TERM。助手运行中捕获 Ctrl+C 后向 sudo 转发 SIGINT，并等待助手结束后再释放用户事务锁，避免直接杀死 sudo 留下特权子进程。
+
+统一 `off` 在同一恢复型锁内续接已校验的 `restore` journal：先完成必要的嵌套恢复，重新核验 journal 类型及绑定，然后按原目标前向还原。未完成的 `apply` 不会被当作关闭；未知内容、错误绑定、不可判断的锁所有者继续拒绝覆盖。自动补偿不会重新交互认证；手动 `recover` 在需要写机器资源前认证。Ctrl+C 返回 130，JSON 使用 CANCELLED，提示保留状态并继续 off/recover，不声称整个配置已经回滚。

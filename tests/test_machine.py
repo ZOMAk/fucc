@@ -31,7 +31,7 @@ def machine(tmp_path):
         return ""
 
     options = {"root": str(tmp_path), "trusted_uid": os.getuid(), "effective_uid": lambda: 0,
-               "sudo_uid": lambda: "1000", "discover_browsers": lambda: browsers, "run_command": run}
+               "sudo_uid": lambda: "1000", "discover_browsers": lambda: browsers, "run_command": run, "authorize": lambda: None}
     return {"root": tmp_path, "options": options, "browsers": browsers, "zone": zone, "failure": failure, "commands": commands,
             "chrome": Path(browsers[0]["directory"]) / "fucc.json"}
 
@@ -309,10 +309,10 @@ def test_adapter_passes_only_isolated_absolute_helper_and_validates_result(machi
         calls.append((command, kwargs))
         return type("Result", (), {"returncode": 0, "stdout": json.dumps({"schemaVersion": 1, "ok": True, "machine": {"scope": "machine", "active": True, "region": "us", "ownerUid": 1000, "recoveryRequired": False}})})()
 
-    with patch("fucc.machine.os.getuid", return_value=1000), patch("fucc.machine.subprocess.run", side_effect=invoke):
+    with patch("fucc.machine.os.getuid", return_value=1000), patch("fucc.machine._run_helper", side_effect=invoke):
         adapter = MachineAdapter("/opt/fucc/scripts/fucc", "/opt/conda/envs/fucc/bin/python", {"TERM": "xterm", "PYTHONPATH": "/dangerous", "PYTHONINSPECT": "1"}, machine["options"])
         adapter.resource.write(adapter.desired("us"))
-    assert calls[0][0] == ["/usr/bin/sudo", "--", "/opt/conda/envs/fucc/bin/python", "-I", "/opt/fucc/scripts/fucc", "__machine", "on", "--owner", "1000", "--region", "us"]
+    assert calls[0][0] == ["/usr/bin/sudo", "-n", "--", "/opt/conda/envs/fucc/bin/python", "-I", "/opt/fucc/scripts/fucc", "__machine", "on", "--owner", "1000", "--region", "us"]
     assert calls[0][1]["env"] == {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TERM": "xterm"}
     assert "stdin" not in calls[0][1] and "stderr" not in calls[0][1]
 
@@ -326,7 +326,7 @@ def test_dynamic_adapter_uses_validated_timezone_in_helper_argument(machine):
         calls.append((command, kwargs))
         return type("Result", (), {"returncode": 0, "stdout": json.dumps(fake)})()
 
-    with patch("fucc.machine.os.getuid", return_value=1000), patch("fucc.machine.subprocess.run", side_effect=invoke):
+    with patch("fucc.machine.os.getuid", return_value=1000), patch("fucc.machine._run_helper", side_effect=invoke):
         adapter = MachineAdapter("/opt/fucc/scripts/fucc", "/opt/conda/envs/fucc/bin/python", {}, machine["options"])
         adapter.resource.write(adapter.desired("us", "US/Pacific"))
     assert calls[0][0][-4:] == ["--region", "us", "--timezone", "America/Los_Angeles"]
@@ -343,7 +343,7 @@ def test_dynamic_helper_rejects_wrong_or_ambiguous_target_timezone(machine, repo
     if override is not None:
         payload["timezone"] = override
     fake = type("Result", (), {"returncode": 0, "stdout": json.dumps(payload)})()
-    with patch("fucc.machine.subprocess.run", return_value=fake), pytest.raises(FuccError) as exc:
+    with patch("fucc.machine._run_helper", return_value=fake), pytest.raises(FuccError) as exc:
         adapter.resource.write(adapter.desired("us", "America/Los_Angeles"))
     assert exc.value.code == "MACHINE_HELPER_FAILED"
 
@@ -363,7 +363,7 @@ def test_helper_rejects_wrong_region_result(machine):
     with patch("fucc.machine.os.getuid", return_value=1000):
         adapter = MachineAdapter("/opt/fucc/scripts/fucc", "/usr/bin/python3", test_options=machine["options"])
     fake = type("Result", (), {"returncode": 0, "stdout": json.dumps({"scope": "machine", "active": True, "region": "eu", "ownerUid": 1000, "recoveryRequired": False})})()
-    with patch("fucc.machine.subprocess.run", return_value=fake), pytest.raises(FuccError) as exc:
+    with patch("fucc.machine._run_helper", return_value=fake), pytest.raises(FuccError) as exc:
         adapter.resource.write(adapter.desired("us"))
     assert exc.value.code == "MACHINE_HELPER_FAILED"
 

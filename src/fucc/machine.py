@@ -5,10 +5,12 @@ The options argument exists for unit tests and is never exposed as CLI flags.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import subprocess
 
@@ -591,8 +593,60 @@ def run_machine_action(action, region=None, owner_uid=None, options=None, timezo
         return {**_summary(ctx, state, installations), "kind": result["kind"]}
 
 
+def _sudo_environment(environment):
+    env = {"PATH": SYSTEM_ENV["PATH"]}
+    if "TERM" in environment:
+        env["TERM"] = environment["TERM"]
+    return env
+
+
+def _authorize(environment):
+    try:
+        result = subprocess.run(["/usr/bin/sudo", "-v"], env=_sudo_environment(environment))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise FuccError("管理员认证未完成，尚未开始修改配置；请确认 sudo 可用后重试。", "ADMINISTRATOR_REQUIRED", 10) from exc
+    if result.returncode in (-signal.SIGINT, 130):
+        raise KeyboardInterrupt
+    if result.returncode:
+        raise FuccError("管理员认证未成功，尚未开始修改配置；请完成 sudo 认证后重试。", "ADMINISTRATOR_REQUIRED", 10)
+
+
+def _run_helper(command, **kwargs):
+    # Killing sudo on KeyboardInterrupt can leave its privileged child running.
+    # Relay SIGINT and wait for the helper before releasing the user journal lock.
+    with subprocess.Popen(command, **kwargs) as child:
+        interrupted = False
+        relay_error = None
+        while True:
+            try:
+                stdout, _ = child.communicate()
+                break
+            except KeyboardInterrupt:
+                interrupted = True
+                if relay_error is not None:
+                    continue
+                while True:
+                    try:
+                        child.send_signal(signal.SIGINT)
+                        break
+                    except KeyboardInterrupt:
+                        continue
+                    except ProcessLookupError:
+                        break
+                    except OSError as exc:
+                        if exc.errno == errno.EINTR:
+                            continue
+                        relay_error = exc
+                        break
+        if relay_error is not None:
+            raise relay_error
+        if interrupted:
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(command, child.returncode, stdout)
+
+
 def _invoke_helper(python_path, entrypoint, action, owner_uid, environment, region=None, timezone=None, firefox=None):
-    command = ["/usr/bin/sudo", "--", python_path, "-I", entrypoint, "__machine", action, "--owner", str(owner_uid)]
+    command = ["/usr/bin/sudo", "-n", "--", python_path, "-I", entrypoint, "__machine", action, "--owner", str(owner_uid)]
     if region is not None:
         command.extend(["--region", region])
     if timezone is not None:
@@ -601,12 +655,13 @@ def _invoke_helper(python_path, entrypoint, action, owner_uid, environment, regi
         if type(firefox) is not bool or action != "on":
             raise _fail("INVALID_ACTION", "Firefox 配置档参数无效")
         command.extend(["--firefox", "on" if firefox else "off"])
-    env = {"PATH": SYSTEM_ENV["PATH"]}
-    if "TERM" in environment:
-        env["TERM"] = environment["TERM"]
+    env = _sudo_environment(environment)
     try:
-        # The controlling terminal, stdin and stderr retain sudo's normal prompt.
-        result = subprocess.run(command, stdout=subprocess.PIPE, text=True, env=env)
+        # Authentication is completed before the outer journal is published.
+        # Do not introduce another password prompt while resources are changing.
+        result = _run_helper(command, stdout=subprocess.PIPE, text=True, env=env)
+        if result.returncode in (-signal.SIGINT, 130):
+            raise KeyboardInterrupt
         if result.returncode or len(result.stdout.encode()) > 1024 * 1024:
             raise ValueError("helper failed")
         envelope = json.loads(result.stdout)
@@ -647,6 +702,18 @@ class MachineAdapter:
 
     def inspect(self):
         return run_machine_action("status", owner_uid=self.owner_uid, options=self.test_options)
+
+    def authorize(self):
+        try:
+            current = self.inspect()
+        except FuccError as exc:
+            if exc.code != "MACHINE_STATE_INVALID":
+                raise
+        else:
+            if current["ownerUid"] is not None and current["ownerUid"] != self.owner_uid:
+                raise _fail("OWNER_MISMATCH", "机器配置属于另一个用户")
+        authenticate = self.test_options.get("authorize") if self.test_options is not None else None
+        (authenticate if authenticate is not None else lambda: _authorize(self.environment))()
 
     def desired(self, region, timezone=None):
         if not _region(region):

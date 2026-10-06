@@ -50,7 +50,7 @@ def run_command(command, arguments):
     return ""
 options = {"root": str(base / "machine"), "trusted_uid": os.getuid(),
            "effective_uid": lambda: 0, "sudo_uid": lambda: str(os.getuid()),
-           "discover_browsers": lambda: browsers, "run_command": run_command}
+           "discover_browsers": lambda: browsers, "run_command": run_command, "authorize": lambda: None}
 def helper(python_path, entrypoint, verb, owner_uid, env, region=None, timezone=None, firefox=None):
     kwargs = {"timezone": timezone}
     if 3 in SCHEMAS:
